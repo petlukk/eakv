@@ -1,0 +1,67 @@
+// Q4_1 dequantization from u8-packed weights
+// Each u8 byte holds two 4-bit values: hi*16 + lo
+// Dequantized value = to_f32(nibble) * scale + bias
+//
+// Note: to_i32() on u8 sign-extends values >= 128, so we correct
+// negative values by adding 256 to recover the unsigned byte value.
+
+export func q4_dequantize_u8_f32(
+    weights: *restrict u8,
+    scales: *restrict f32,
+    biases: *restrict f32,
+    out: *mut f32,
+    n_groups: i32
+) {
+    let mut g: i32 = 0
+    while g < n_groups {
+        let scale: f32 = scales[g]
+        let bias: f32 = biases[g]
+        let w_base: i32 = g * 32
+        let o_base: i32 = g * 64
+
+        let mut k: i32 = 0
+        while k < 32 {
+            let mut packed: i32 = to_i32(weights[w_base + k])
+            if packed < 0 { packed = packed + 256 }
+            let lo: i32 = packed % 16
+            let hi: i32 = packed / 16
+            out[o_base + k * 2] = to_f32(lo) * scale + bias
+            out[o_base + k * 2 + 1] = to_f32(hi) * scale + bias
+            k = k + 1
+        }
+
+        g = g + 1
+    }
+}
+
+// Partial dequantize from u8 weights
+export func q4_dequantize_range_u8_f32(
+    weights: *restrict u8,
+    scales: *restrict f32,
+    biases: *restrict f32,
+    out: *mut f32,
+    group_start: i32,
+    group_count: i32
+) {
+    let mut i: i32 = 0
+    while i < group_count {
+        let g: i32 = group_start + i
+        let scale: f32 = scales[g]
+        let bias: f32 = biases[g]
+        let w_base: i32 = g * 32
+        let o_base: i32 = i * 64
+
+        let mut k: i32 = 0
+        while k < 32 {
+            let mut packed: i32 = to_i32(weights[w_base + k])
+            if packed < 0 { packed = packed + 256 }
+            let lo: i32 = packed % 16
+            let hi: i32 = packed / 16
+            out[o_base + k * 2] = to_f32(lo) * scale + bias
+            out[o_base + k * 2 + 1] = to_f32(hi) * scale + bias
+            k = k + 1
+        }
+
+        i = i + 1
+    }
+}

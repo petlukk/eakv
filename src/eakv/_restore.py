@@ -6,6 +6,7 @@ from numpy.typing import NDArray
 
 from ._bundle import Q4Bundle
 from ._ops import q4_dequantize_f32, q4_dequantize_range_f32
+from ._ops import q4_dequantize_u8_f32, q4_dequantize_range_u8_f32
 
 
 def dequantize(bundle: Q4Bundle) -> NDArray:
@@ -74,12 +75,14 @@ def restore(
         dtype=np.float32,
     )
 
+    _dequant = _pick_dequantize(bundle)
+
     for li, layer in enumerate(layer_indices):
         for kv_idx in range(2):
             # Full dequantize this layer/kv
             n_groups = bundle.n_groups_per_layer
             full_flat = np.empty(n_groups * 64, dtype=np.float32)
-            q4_dequantize_f32(
+            _dequant(
                 bundle.weights[layer, kv_idx],
                 bundle.scales[layer, kv_idx],
                 bundle.biases[layer, kv_idx],
@@ -97,17 +100,25 @@ def restore(
     return out
 
 
+def _pick_dequantize(bundle: Q4Bundle):
+    """Select the right dequantize kernel based on weights dtype."""
+    if bundle.weights.dtype == np.uint8:
+        return q4_dequantize_u8_f32
+    return q4_dequantize_f32
+
+
 def _full_restore(bundle: Q4Bundle, out_dtype: str) -> NDArray:
     out = np.empty(
         (bundle.n_layers, 2, bundle.n_heads, bundle.seq_len, bundle.head_dim),
         dtype=np.float32,
     )
     n_groups = bundle.n_groups_per_layer
+    _dequant = _pick_dequantize(bundle)
 
     for layer in range(bundle.n_layers):
         for kv_idx in range(2):
             flat = np.empty(n_groups * 64, dtype=np.float32)
-            q4_dequantize_f32(
+            _dequant(
                 bundle.weights[layer, kv_idx],
                 bundle.scales[layer, kv_idx],
                 bundle.biases[layer, kv_idx],

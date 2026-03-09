@@ -11,8 +11,8 @@ class Q4Bundle:
     """Quantized KV cache in Q4_1 format.
 
     Attributes:
-        weights: Packed values as i32, shape (n_layers, 2, n_groups_per_layer * 32)
-                 Axis 1: 0=K, 1=V. Each i32 is a packed byte (0-255).
+        weights: Packed values as u8, shape (n_layers, 2, n_groups_per_layer * 32)
+                 Axis 1: 0=K, 1=V. Each byte is a packed pair of 4-bit values (0-255).
         scales: Per-group scales, shape (n_layers, 2, n_groups_per_layer) -- f32
         biases: Per-group biases, shape (n_layers, 2, n_groups_per_layer) -- f32
         n_layers: Number of transformer layers

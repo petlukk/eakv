@@ -34,8 +34,8 @@ def test_full_workflow():
 def test_compression_ratio():
     kv = np.random.randn(32, 2, 32, 128, 128).astype(np.float32)
     bundle = eakv.quantize(kv)
-    # weights are i32 (4 bytes each, 32 per group = 128 bytes) + 4 scale + 4 bias = 136 bytes per group
+    # weights are u8 (1 byte each, 32 per group = 32 bytes) + 4 scale + 4 bias = 40 bytes per group
     # original: 64 * 4 = 256 bytes per group (f32)
-    # ratio: 136/256 ~ 0.53
-    assert bundle.compression_ratio < 0.6
-    assert bundle.compression_ratio > 0.3
+    # ratio: 40/256 ~ 0.156
+    assert bundle.compression_ratio < 0.25
+    assert bundle.compression_ratio > 0.1

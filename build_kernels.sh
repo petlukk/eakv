@@ -33,7 +33,7 @@ esac
 
 echo "Building eakv kernels (ea=$EA)..."
 
-for kernel in quantize dequantize validate; do
+for kernel in quantize dequantize dequantize_u8 validate; do
     src="$KERNEL_DIR/${kernel}.ea"
     if [ ! -f "$src" ]; then
         echo "  WARNING: $src not found, skipping" >&2

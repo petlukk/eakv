@@ -117,13 +117,13 @@ def save(
         # Write data blocks
         for layer in range(n_layers):
             for kv_idx in range(2):
-                # Convert weights from int32 to uint8
-                w_i32 = bundle.weights[layer, kv_idx]
-                w_u8 = w_i32.astype(np.uint8)
+                w = np.ascontiguousarray(bundle.weights[layer, kv_idx])
+                if w.dtype != np.uint8:
+                    w = w.astype(np.uint8)
                 s = np.ascontiguousarray(bundle.scales[layer, kv_idx])
                 b = np.ascontiguousarray(bundle.biases[layer, kv_idx])
 
-                f.write(w_u8.tobytes())
+                f.write(w.tobytes())
                 f.write(s.tobytes())
                 f.write(b.tobytes())
 
@@ -175,7 +175,7 @@ def _parse(data, source_mmap=None):
     scales_size = n_groups * 4
     biases_size = n_groups * 4
 
-    all_weights = np.empty((n_layers, 2, n_groups * 32), dtype=np.int32)
+    all_weights = np.empty((n_layers, 2, n_groups * 32), dtype=np.uint8)
     all_scales = np.empty((n_layers, 2, n_groups), dtype=np.float32)
     all_biases = np.empty((n_layers, 2, n_groups), dtype=np.float32)
 
@@ -184,8 +184,7 @@ def _parse(data, source_mmap=None):
             off = offsets[layer][kv_idx]
 
             w_bytes = data[off:off + weights_size]
-            w_u8 = np.frombuffer(w_bytes, dtype=np.uint8).copy()
-            all_weights[layer, kv_idx] = w_u8.astype(np.int32)
+            all_weights[layer, kv_idx] = np.frombuffer(w_bytes, dtype=np.uint8).copy()
 
             s_off = off + weights_size
             s_bytes = data[s_off:s_off + scales_size]
@@ -213,8 +212,7 @@ def _parse(data, source_mmap=None):
 def open_mmap(path: str):
     """Memory-map a .eakv file. Yields Q4Bundle backed by mmap.
 
-    The arrays share the mmap memory where possible (scales, biases).
-    Weights are converted from uint8 to int32, so they get a copy.
+    The arrays are copies from the mmap for safe use after close.
     """
     f = open(path, "rb")
     try:
@@ -261,7 +259,7 @@ def _parse_mmap(mm):
     scales_size = n_groups * 4
     biases_size = n_groups * 4
 
-    all_weights = np.empty((n_layers, 2, n_groups * 32), dtype=np.int32)
+    all_weights = np.empty((n_layers, 2, n_groups * 32), dtype=np.uint8)
     all_scales = np.empty((n_layers, 2, n_groups), dtype=np.float32)
     all_biases = np.empty((n_layers, 2, n_groups), dtype=np.float32)
 
@@ -269,8 +267,9 @@ def _parse_mmap(mm):
         for kv_idx in range(2):
             off = offsets[layer][kv_idx]
 
-            w_u8 = np.frombuffer(mm, dtype=np.uint8, count=weights_size, offset=off)
-            all_weights[layer, kv_idx] = w_u8.astype(np.int32)
+            all_weights[layer, kv_idx] = np.frombuffer(
+                mm, dtype=np.uint8, count=weights_size, offset=off
+            ).copy()
 
             s_off = off + weights_size
             all_scales[layer, kv_idx] = np.frombuffer(

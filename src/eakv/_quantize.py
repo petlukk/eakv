@@ -47,8 +47,8 @@ def quantize(kv_cache: NDArray) -> Q4Bundle:
     n_groups = elements_per_layer_kv // 64
 
     # Allocate output arrays
-    # weights: 32 i32 per group (one i32 per packed byte)
-    all_weights = np.empty((n_layers, 2, n_groups * 32), dtype=np.int32)
+    # weights: 32 i32 per group (one i32 per packed byte) — quantize kernel outputs i32
+    tmp_weights = np.empty((n_layers, 2, n_groups * 32), dtype=np.int32)
     all_scales = np.empty((n_layers, 2, n_groups), dtype=np.float32)
     all_biases = np.empty((n_layers, 2, n_groups), dtype=np.float32)
 
@@ -57,11 +57,14 @@ def quantize(kv_cache: NDArray) -> Q4Bundle:
             flat = np.ascontiguousarray(kv_f32[layer, kv_idx].ravel())
             q4_quantize_f32(
                 flat,
-                all_weights[layer, kv_idx],
+                tmp_weights[layer, kv_idx],
                 all_scales[layer, kv_idx],
                 all_biases[layer, kv_idx],
                 n_groups,
             )
+
+    # Convert i32 -> u8 (each value is 0-255, fits in a byte)
+    all_weights = tmp_weights.astype(np.uint8)
 
     return Q4Bundle(
         weights=all_weights,
