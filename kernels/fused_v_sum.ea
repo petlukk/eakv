@@ -1,29 +1,38 @@
 // Fused V weighted sum: sum_t(weight[t] * dequant(V[t]))
 //
-// For each position t:
-//   Load packed V bytes, dequant inline, multiply by softmax weight,
-//   accumulate into output vector [128].
-//
-// Output vector (512 bytes) stays in L1 the entire time.
-// Caller must zero out_vec before calling.
+// Optimizations:
+//   - Output vector kept in 8 ZMM register accumulators, stored once at end
+//   - group_offset parameter: no Python copy needed
+//   - Eliminates 8 loads + 8 stores per position (was the main bottleneck)
 
 export func q4_fused_v_sum_f32(
-    weights:  *restrict f32,
-    v_packed: *restrict u8,
-    v_scales: *restrict f32,
-    v_biases: *restrict f32,
-    out_vec:  *mut f32,
-    seq_len:  i32
+    weights:      *restrict f32,
+    v_packed:     *restrict u8,
+    v_scales:     *restrict f32,
+    v_biases:     *restrict f32,
+    out_vec:      *mut f32,
+    seq_len:      i32,
+    group_offset: i32
 ) {
     let mask15: u8x16 = splat(15)
     let div16: u8x16 = splat(16)
+
+    // Output accumulators in registers — no memory load/store per position
+    let mut o0: f32x16 = splat(0.0)
+    let mut o1: f32x16 = splat(0.0)
+    let mut o2: f32x16 = splat(0.0)
+    let mut o3: f32x16 = splat(0.0)
+    let mut o4: f32x16 = splat(0.0)
+    let mut o5: f32x16 = splat(0.0)
+    let mut o6: f32x16 = splat(0.0)
+    let mut o7: f32x16 = splat(0.0)
 
     let mut t: i32 = 0
     while t < seq_len {
         let vw: f32x16 = splat(weights[t])
 
         // --- Group 0: dimensions 0-63 ---
-        let g0: i32 = t * 2
+        let g0: i32 = group_offset + t * 2
         let vs0: f32x16 = splat(v_scales[g0])
         let vb0: f32x16 = splat(v_biases[g0])
         let wb0: i32 = g0 * 32
@@ -36,22 +45,17 @@ export func q4_fused_v_sum_f32(
         let lo0b: u8x16 = p0b .& mask15
         let hi0b: u8x16 = p0b ./ div16
 
-        // Dequant, scale by weight, accumulate into output
         let d0: f32x16 = fma(widen_u8_f32x16(lo0a), vs0, vb0)
-        let o0: f32x16 = load(out_vec, 0)
-        store(out_vec, 0, fma(d0, vw, o0))
+        o0 = fma(d0, vw, o0)
 
         let d1: f32x16 = fma(widen_u8_f32x16(lo0b), vs0, vb0)
-        let o1: f32x16 = load(out_vec, 16)
-        store(out_vec, 16, fma(d1, vw, o1))
+        o1 = fma(d1, vw, o1)
 
         let d2: f32x16 = fma(widen_u8_f32x16(hi0a), vs0, vb0)
-        let o2: f32x16 = load(out_vec, 32)
-        store(out_vec, 32, fma(d2, vw, o2))
+        o2 = fma(d2, vw, o2)
 
         let d3: f32x16 = fma(widen_u8_f32x16(hi0b), vs0, vb0)
-        let o3: f32x16 = load(out_vec, 48)
-        store(out_vec, 48, fma(d3, vw, o3))
+        o3 = fma(d3, vw, o3)
 
         // --- Group 1: dimensions 64-127 ---
         let g1: i32 = g0 + 1
@@ -68,21 +72,27 @@ export func q4_fused_v_sum_f32(
         let hi1b: u8x16 = p1b ./ div16
 
         let d4: f32x16 = fma(widen_u8_f32x16(lo1a), vs1, vb1)
-        let o4: f32x16 = load(out_vec, 64)
-        store(out_vec, 64, fma(d4, vw, o4))
+        o4 = fma(d4, vw, o4)
 
         let d5: f32x16 = fma(widen_u8_f32x16(lo1b), vs1, vb1)
-        let o5: f32x16 = load(out_vec, 80)
-        store(out_vec, 80, fma(d5, vw, o5))
+        o5 = fma(d5, vw, o5)
 
         let d6: f32x16 = fma(widen_u8_f32x16(hi1a), vs1, vb1)
-        let o6: f32x16 = load(out_vec, 96)
-        store(out_vec, 96, fma(d6, vw, o6))
+        o6 = fma(d6, vw, o6)
 
         let d7: f32x16 = fma(widen_u8_f32x16(hi1b), vs1, vb1)
-        let o7: f32x16 = load(out_vec, 112)
-        store(out_vec, 112, fma(d7, vw, o7))
+        o7 = fma(d7, vw, o7)
 
         t = t + 1
     }
+
+    // Store accumulated output once
+    store(out_vec, 0, o0)
+    store(out_vec, 16, o1)
+    store(out_vec, 32, o2)
+    store(out_vec, 48, o3)
+    store(out_vec, 64, o4)
+    store(out_vec, 80, o5)
+    store(out_vec, 96, o6)
+    store(out_vec, 112, o7)
 }
