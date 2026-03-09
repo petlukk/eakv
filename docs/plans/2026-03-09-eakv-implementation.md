@@ -1,0 +1,1867 @@
+# eakv v0.1 Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** Build a pip-installable Q4 KV cache engine with Ea SIMD kernels for ~25x faster LLM session resumption.
+
+**Architecture:** Ea kernels (.ea) compiled to shared libraries (.so), loaded via ctypes in Python. Binary .eakv file format with mmap support. Same pattern as eavec in eacompute.
+
+**Tech Stack:** Ea (SIMD kernels), Python 3.9+ (numpy, ctypes), pytest, zstd (optional compression)
+
+**Reference files:**
+- Design: `docs/plans/2026-03-09-eakv-design.md`
+- eavec pattern: `/root/dev/eacompute/packages/eavec/`
+- Ea compiler: `ea` binary (must be on PATH)
+- Ea language examples: `/root/dev/eacompute/examples/`
+- Ea intrinsics reference: `/root/dev/eacompute/src/typeck/intrinsics.rs` and `intrinsics_simd.rs`
+
+---
+
+### Task 1: Project Scaffolding
+
+**Files:**
+- Create: `pyproject.toml`
+- Create: `src/eakv/__init__.py` (empty placeholder)
+- Create: `src/eakv/lib/.gitkeep`
+- Create: `kernels/` (empty dir)
+- Create: `include/` (empty dir)
+- Create: `tests/__init__.py` (empty)
+- Create: `benchmarks/` (empty dir)
+
+**Step 1: Create pyproject.toml**
+
+```toml
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eakv"
+version = "0.1.0"
+description = "Fast Q4 KV cache quantization and restore for LLM inference"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+compress = ["zstandard>=0.20"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+eakv = ["lib/*.so", "lib/*.dll", "py.typed"]
+```
+
+**Step 2: Create directory structure**
+
+```bash
+mkdir -p src/eakv/lib kernels include tests benchmarks
+touch src/eakv/__init__.py src/eakv/lib/.gitkeep tests/__init__.py
+```
+
+**Step 3: Create .gitignore**
+
+```
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.so
+*.dll
+*.o
+*.ea.json
+.pytest_cache/
+```
+
+Note: .gitignore ignores .so globally, but `src/eakv/lib/*.so` is force-added since it's the shipped binary.
+
+**Step 4: Verify structure**
+
+```bash
+ls -R src/ kernels/ tests/
+```
+
+**Step 5: Commit**
+
+```bash
+git add pyproject.toml src/ kernels/ include/ tests/ benchmarks/ .gitignore
+git commit -m "feat: project scaffolding for eakv v0.1"
+```
+
+---
+
+### Task 2: Quantize Kernel (quantize.ea)
+
+**Files:**
+- Create: `kernels/quantize.ea`
+- Reference: `/root/dev/eacompute/examples/fma.ea` for Ea syntax
+- Reference: `/root/dev/eacompute/src/typeck/intrinsics_simd.rs` for available SIMD intrinsics
+
+**Step 1: Check available Ea intrinsics**
+
+Before writing the kernel, read these files to confirm available operations:
+
+```bash
+# Check what reduce/min/max/conversion intrinsics exist
+grep -n "reduce\|min\|max\|convert\|cast\|trunc\|round\|clamp" \
+    /root/dev/eacompute/src/typeck/intrinsics_simd.rs \
+    /root/dev/eacompute/src/typeck/intrinsics.rs \
+    /root/dev/eacompute/src/typeck/intrinsics_conv.rs
+```
+
+This determines whether we use SIMD min/max reductions or scalar fallback for the per-group min/max pass.
+
+**Step 2: Write quantize.ea**
+
+Algorithm per group of 64 f32 values:
+1. Scan group for min, max (scalar loop is fine — quantize is not the hot path)
+2. `scale = (max - min) / 15.0` (avoid div-by-zero: if max == min, scale = 1.0)
+3. `bias = min`
+4. For each value: `q = round((val - bias) / scale)`, clamp to [0, 15]
+5. Pack two 4-bit values into one u8: `packed = (q_hi << 4) | q_lo`
+6. Write: 32 bytes packed weights + 4 bytes scale (f32) + 4 bytes bias (f32) = 40 bytes per group
+
+```ea
+export func q4_quantize_f32(
+    src: *restrict f32,
+    weights_out: *mut u8,
+    scales_out: *mut f32,
+    biases_out: *mut f32,
+    n_groups: i32
+) {
+    let mut g: i32 = 0
+    while g < n_groups {
+        let base: i32 = g * 64
+
+        // Find min/max (scalar — quantize is not the hot path)
+        let mut min_val: f32 = src[base]
+        let mut max_val: f32 = src[base]
+        let mut j: i32 = 1
+        while j < 64 {
+            let v: f32 = src[base + j]
+            if v < min_val { min_val = v }
+            if v > max_val { max_val = v }
+            j = j + 1
+        }
+
+        // Compute scale and bias
+        let range: f32 = max_val - min_val
+        let scale: f32 = if range > 0.0 { range / 15.0 } else { 1.0 }
+        let inv_scale: f32 = if range > 0.0 { 15.0 / range } else { 0.0 }
+        let bias: f32 = min_val
+
+        scales_out[g] = scale
+        biases_out[g] = bias
+
+        // Quantize and pack pairs into bytes
+        let w_base: i32 = g * 32
+        let mut k: i32 = 0
+        while k < 64 {
+            let v0: f32 = (src[base + k] - bias) * inv_scale
+            let v1: f32 = (src[base + k + 1] - bias) * inv_scale
+
+            // Round and clamp to [0, 15]
+            let mut q0: i32 = float_to_int(v0 + 0.5)
+            let mut q1: i32 = float_to_int(v1 + 0.5)
+            if q0 < 0 { q0 = 0 }
+            if q0 > 15 { q0 = 15 }
+            if q1 < 0 { q1 = 0 }
+            if q1 > 15 { q1 = 15 }
+
+            weights_out[w_base + k / 2] = (q1 << 4) | q0
+            k = k + 2
+        }
+
+        g = g + 1
+    }
+}
+```
+
+**Important:** The exact syntax for `if/else` expressions, integer casts, and byte-level stores depends on what Ea supports. Check intrinsics in Step 1. The kernel may need adjustment — for example:
+- If Ea has no `float_to_int`, use a cast or conversion intrinsic
+- If Ea has no `u8` pointer stores, pack into u32 (4 bytes at a time) instead
+- If Ea has no ternary `if`, use `select` or a conditional pattern
+
+The quantize kernel does NOT need SIMD optimization for v0.1. Correctness first. The hot path is dequantize.
+
+**Step 3: Attempt to compile and fix any syntax issues**
+
+```bash
+ea kernels/quantize.ea --lib -o src/eakv/lib/libquantize.so
+```
+
+Iterate on syntax until it compiles. This may require several rounds — Ea's exact syntax for integer ops and byte-level access needs to be validated against the compiler.
+
+**Step 4: Commit**
+
+```bash
+git add kernels/quantize.ea
+git commit -m "feat: add Q4_1 quantize kernel"
+```
+
+---
+
+### Task 3: Dequantize Kernel (dequantize.ea) — THE HOT PATH
+
+**Files:**
+- Create: `kernels/dequantize.ea`
+
+This is the performance-critical kernel. SIMD-optimized.
+
+**Step 1: Write dequantize.ea**
+
+Algorithm per group of 64 values:
+1. Load scale, bias (f32)
+2. Load 32 packed bytes (as u32 array: 8 x u32)
+3. For each u32 (contains 8 nibbles = 8 values):
+   - Extract low nibble: `q = packed & 0xF`
+   - Extract high nibble: `q = (packed >> 4) & 0xF`
+   - Convert to f32: `val = q * scale + bias`
+4. Store 64 f32 values
+
+SIMD strategy: Process 8 quantized values at a time using f32x8. Each u32 contains 8 nibbles (4 values in low byte + 4 values in high byte pattern).
+
+```ea
+export func q4_dequantize_f32(
+    weights: *restrict u8,
+    scales: *restrict f32,
+    biases: *restrict f32,
+    out: *mut f32,
+    n_groups: i32
+) {
+    let mut g: i32 = 0
+    while g < n_groups {
+        let scale: f32 = scales[g]
+        let bias: f32 = biases[g]
+        let w_base: i32 = g * 32
+        let o_base: i32 = g * 64
+
+        // Unpack and dequantize
+        let mut k: i32 = 0
+        while k < 32 {
+            let packed: i32 = weights[w_base + k]
+            let q_lo: f32 = int_to_float(packed & 15)
+            let q_hi: f32 = int_to_float((packed >> 4) & 15)
+            out[o_base + k * 2] = q_lo * scale + bias
+            out[o_base + k * 2 + 1] = q_hi * scale + bias
+            k = k + 1
+        }
+
+        g = g + 1
+    }
+}
+
+// Partial restore: dequantize a contiguous range of groups
+export func q4_dequantize_range_f32(
+    weights: *restrict u8,
+    scales: *restrict f32,
+    biases: *restrict f32,
+    out: *mut f32,
+    group_start: i32,
+    group_count: i32
+) {
+    let mut g: i32 = 0
+    while g < group_count {
+        let src_g: i32 = group_start + g
+        let scale: f32 = scales[src_g]
+        let bias: f32 = biases[src_g]
+        let w_base: i32 = src_g * 32
+        let o_base: i32 = g * 64
+
+        let mut k: i32 = 0
+        while k < 32 {
+            let packed: i32 = weights[w_base + k]
+            let q_lo: f32 = int_to_float(packed & 15)
+            let q_hi: f32 = int_to_float((packed >> 4) & 15)
+            out[o_base + k * 2] = q_lo * scale + bias
+            out[o_base + k * 2 + 1] = q_hi * scale + bias
+            k = k + 1
+        }
+
+        g = g + 1
+    }
+}
+```
+
+**SIMD optimization opportunity (v0.1 stretch goal):** If the inner loop can be vectorized — unpack 8 nibbles into an i32x8, convert to f32x8, apply `fma(q_vec, scale_splat, bias_splat)`, store — that would be ideal. Depends on available Ea intrinsics for integer-to-float conversion on vectors.
+
+**Step 2: Compile**
+
+```bash
+ea kernels/dequantize.ea --lib -o src/eakv/lib/libdequantize.so
+```
+
+**Step 3: Commit**
+
+```bash
+git add kernels/dequantize.ea
+git commit -m "feat: add Q4_1 dequantize kernel with partial range support"
+```
+
+---
+
+### Task 4: Build Script + Python Loader
+
+**Files:**
+- Create: `build_kernels.sh`
+- Create: `src/eakv/_loader.py`
+
+**Step 1: Write build_kernels.sh**
+
+Follow eavec pattern exactly:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KERNEL_DIR="$SCRIPT_DIR/kernels"
+OUT_DIR="$SCRIPT_DIR/src/eakv/lib"
+
+mkdir -p "$OUT_DIR"
+
+# Detect platform
+case "$(uname -s)" in
+    Linux*)  EXT=".so"; PREFIX="lib";;
+    Darwin*) EXT=".dylib"; PREFIX="lib";;
+    MINGW*|MSYS*|CYGWIN*) EXT=".dll"; PREFIX="";;
+    *) echo "Unsupported platform"; exit 1;;
+esac
+
+echo "Building eakv kernels..."
+
+for kernel in quantize dequantize validate append; do
+    src="$KERNEL_DIR/${kernel}.ea"
+    if [ -f "$src" ]; then
+        echo "  Compiling $kernel..."
+        ea "$src" --lib -o "$OUT_DIR/${PREFIX}${kernel}${EXT}"
+    else
+        echo "  Skipping $kernel (not found)"
+    fi
+done
+
+echo "Done. Libraries in $OUT_DIR/"
+ls -la "$OUT_DIR/"
+```
+
+**Step 2: Write _loader.py**
+
+```python
+"""Dynamic library loader for eakv SIMD kernels."""
+
+import ctypes
+import platform
+import sys
+from pathlib import Path
+
+
+def _lib_dir() -> Path:
+    return Path(__file__).parent / "lib"
+
+
+def _platform_tag() -> str:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        machine = "x86_64"
+    elif machine in ("aarch64", "arm64"):
+        machine = "aarch64"
+    return f"{system}_{machine}"
+
+
+def load_library(name: str) -> ctypes.CDLL:
+    """Load a compiled Ea kernel library by name."""
+    lib_dir = _lib_dir()
+
+    if sys.platform == "win32":
+        path = lib_dir / f"{name}.dll"
+    elif sys.platform == "darwin":
+        path = lib_dir / f"lib{name}.dylib"
+    else:
+        path = lib_dir / f"lib{name}.so"
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"eakv kernel library not found: {path}\n"
+            f"Run ./build_kernels.sh to compile kernels."
+        )
+
+    return ctypes.CDLL(str(path))
+```
+
+**Step 3: Verify loader finds nothing yet (expected)**
+
+```bash
+cd /root/dev/eakv
+python -c "from eakv._loader import load_library; load_library('quantize')" 2>&1 || echo "Expected: FileNotFoundError"
+```
+
+**Step 4: Commit**
+
+```bash
+chmod +x build_kernels.sh
+git add build_kernels.sh src/eakv/_loader.py
+git commit -m "feat: add kernel build script and ctypes loader"
+```
+
+---
+
+### Task 5: Compile Kernels + Write Python Ops Layer
+
+**Files:**
+- Create: `src/eakv/_ops.py`
+
+**Step 1: Build kernels**
+
+```bash
+cd /root/dev/eakv && ./build_kernels.sh
+```
+
+Fix any compilation errors. This is the first real test of the Ea kernels.
+
+**Step 2: Write _ops.py — low-level ctypes wrappers**
+
+```python
+"""Low-level ctypes wrappers for eakv SIMD kernels."""
+
+import ctypes
+import numpy as np
+from numpy.typing import NDArray
+
+from ._loader import load_library
+
+_lib_quantize = load_library("quantize")
+_lib_dequantize = load_library("dequantize")
+
+# --- quantize ---
+_q4_quantize_f32 = _lib_quantize.q4_quantize_f32
+_q4_quantize_f32.restype = None
+_q4_quantize_f32.argtypes = [
+    ctypes.POINTER(ctypes.c_float),   # src
+    ctypes.POINTER(ctypes.c_uint8),   # weights_out
+    ctypes.POINTER(ctypes.c_float),   # scales_out
+    ctypes.POINTER(ctypes.c_float),   # biases_out
+    ctypes.c_int32,                   # n_groups
+]
+
+# --- dequantize ---
+_q4_dequantize_f32 = _lib_dequantize.q4_dequantize_f32
+_q4_dequantize_f32.restype = None
+_q4_dequantize_f32.argtypes = [
+    ctypes.POINTER(ctypes.c_uint8),   # weights
+    ctypes.POINTER(ctypes.c_float),   # scales
+    ctypes.POINTER(ctypes.c_float),   # biases
+    ctypes.POINTER(ctypes.c_float),   # out
+    ctypes.c_int32,                   # n_groups
+]
+
+_q4_dequantize_range_f32 = _lib_dequantize.q4_dequantize_range_f32
+_q4_dequantize_range_f32.restype = None
+_q4_dequantize_range_f32.argtypes = [
+    ctypes.POINTER(ctypes.c_uint8),   # weights
+    ctypes.POINTER(ctypes.c_float),   # scales
+    ctypes.POINTER(ctypes.c_float),   # biases
+    ctypes.POINTER(ctypes.c_float),   # out
+    ctypes.c_int32,                   # group_start
+    ctypes.c_int32,                   # group_count
+]
+
+
+def _ptr_f32(arr: NDArray) -> ctypes.POINTER(ctypes.c_float):
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+
+def _ptr_u8(arr: NDArray) -> ctypes.POINTER(ctypes.c_uint8):
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+
+
+def quantize_f32(src: NDArray) -> tuple[NDArray, NDArray, NDArray]:
+    """Quantize flat f32 array to Q4_1. Length must be multiple of 64.
+
+    Returns: (weights_u8, scales_f32, biases_f32)
+    """
+    assert src.dtype == np.float32
+    assert src.ndim == 1
+    n = len(src)
+    assert n % 64 == 0, f"Length must be multiple of 64, got {n}"
+    n_groups = n // 64
+
+    weights = np.empty(n_groups * 32, dtype=np.uint8)
+    scales = np.empty(n_groups, dtype=np.float32)
+    biases = np.empty(n_groups, dtype=np.float32)
+
+    src_c = np.ascontiguousarray(src)
+    _q4_quantize_f32(_ptr_f32(src_c), _ptr_u8(weights), _ptr_f32(scales), _ptr_f32(biases), n_groups)
+
+    return weights, scales, biases
+
+
+def dequantize_f32(weights: NDArray, scales: NDArray, biases: NDArray) -> NDArray:
+    """Dequantize Q4_1 back to f32. Full restore."""
+    n_groups = len(scales)
+    out = np.empty(n_groups * 64, dtype=np.float32)
+
+    _q4_dequantize_f32(_ptr_u8(weights), _ptr_f32(scales), _ptr_f32(biases), _ptr_f32(out), n_groups)
+
+    return out
+
+
+def dequantize_range_f32(
+    weights: NDArray, scales: NDArray, biases: NDArray,
+    group_start: int, group_count: int
+) -> NDArray:
+    """Dequantize a contiguous range of groups. For partial restore."""
+    out = np.empty(group_count * 64, dtype=np.float32)
+
+    _q4_dequantize_range_f32(
+        _ptr_u8(weights), _ptr_f32(scales), _ptr_f32(biases),
+        _ptr_f32(out), group_start, group_count
+    )
+
+    return out
+```
+
+**Step 3: Smoke test**
+
+```python
+import numpy as np
+from eakv._ops import quantize_f32, dequantize_f32
+
+src = np.random.randn(640).astype(np.float32)
+w, s, b = quantize_f32(src)
+restored = dequantize_f32(w, s, b)
+print(f"Max error: {np.max(np.abs(src - restored)):.6f}")
+# Expected: small error (Q4 has ~4-bit precision, max error depends on range)
+```
+
+**Step 4: Commit**
+
+```bash
+git add src/eakv/_ops.py
+git commit -m "feat: add low-level ctypes wrappers for quantize/dequantize"
+```
+
+---
+
+### Task 6: Q4Bundle + High-Level Quantize/Restore API
+
+**Files:**
+- Create: `src/eakv/_bundle.py`
+- Create: `src/eakv/_quantize.py`
+- Create: `src/eakv/_restore.py`
+
+**Step 1: Write _bundle.py — the Q4Bundle dataclass**
+
+```python
+"""Q4Bundle: container for quantized KV cache data."""
+
+from dataclasses import dataclass
+from typing import Optional
+import numpy as np
+from numpy.typing import NDArray
+
+
+@dataclass
+class Q4Bundle:
+    """Quantized KV cache in Q4_1 format.
+
+    Attributes:
+        weights: Packed 4-bit values, shape (n_layers, 2, n_groups_per_layer * 32) — u8
+                 Axis 1: 0=K, 1=V
+        scales: Per-group scales, shape (n_layers, 2, n_groups_per_layer) — f32
+        biases: Per-group biases, shape (n_layers, 2, n_groups_per_layer) — f32
+        n_layers: Number of transformer layers
+        n_heads: Number of KV heads
+        head_dim: Dimension per head
+        seq_len: Current sequence length
+        orig_dtype: Original dtype string ("float32" or "float16")
+        model_hash: Optional model identity for safety
+        tokenizer_hash: Optional tokenizer identity for safety
+    """
+    weights: NDArray
+    scales: NDArray
+    biases: NDArray
+    n_layers: int
+    n_heads: int
+    head_dim: int
+    seq_len: int
+    orig_dtype: str = "float32"
+    model_hash: Optional[str] = None
+    tokenizer_hash: Optional[str] = None
+
+    @property
+    def n_groups_per_layer(self) -> int:
+        """Number of Q4 groups per layer per K/V."""
+        return (self.n_heads * self.head_dim * self.seq_len) // 64
+
+    @property
+    def compressed_size(self) -> int:
+        """Total size in bytes of compressed data."""
+        return self.weights.nbytes + self.scales.nbytes + self.biases.nbytes
+
+    @property
+    def original_size(self) -> int:
+        """Size in bytes of original uncompressed data."""
+        elem_size = 4 if self.orig_dtype == "float32" else 2
+        return self.n_layers * 2 * self.n_heads * self.head_dim * self.seq_len * elem_size
+
+    @property
+    def compression_ratio(self) -> float:
+        return self.compressed_size / self.original_size
+```
+
+**Step 2: Write _quantize.py**
+
+```python
+"""High-level quantize API."""
+
+import numpy as np
+from numpy.typing import NDArray
+
+from ._bundle import Q4Bundle
+from ._ops import quantize_f32
+
+
+def quantize(kv_cache: NDArray) -> Q4Bundle:
+    """Quantize a KV cache tensor to Q4_1.
+
+    Args:
+        kv_cache: KV cache with shape (n_layers, 2, n_heads, seq_len, head_dim)
+                  Axis 1: 0=K, 1=V
+                  dtype: float32 or float16
+
+    Returns:
+        Q4Bundle containing the quantized data.
+    """
+    if kv_cache.ndim != 5:
+        raise ValueError(
+            f"Expected 5D tensor (n_layers, 2, n_heads, seq_len, head_dim), "
+            f"got shape {kv_cache.shape}"
+        )
+
+    n_layers, kv, n_heads, seq_len, head_dim = kv_cache.shape
+    if kv != 2:
+        raise ValueError(f"Expected axis 1 to be 2 (K, V), got {kv}")
+
+    orig_dtype = str(kv_cache.dtype)
+
+    # Convert to f32 for quantization
+    if kv_cache.dtype == np.float16:
+        kv_f32 = kv_cache.astype(np.float32)
+    elif kv_cache.dtype == np.float32:
+        kv_f32 = kv_cache
+    else:
+        raise ValueError(f"Unsupported dtype: {kv_cache.dtype}")
+
+    # Ensure length is multiple of 64
+    elements_per_layer_kv = n_heads * seq_len * head_dim
+    if elements_per_layer_kv % 64 != 0:
+        raise ValueError(
+            f"Elements per layer/KV ({elements_per_layer_kv}) must be multiple of 64. "
+            f"Pad seq_len or head_dim."
+        )
+
+    n_groups = elements_per_layer_kv // 64
+
+    all_weights = np.empty((n_layers, 2, n_groups * 32), dtype=np.uint8)
+    all_scales = np.empty((n_layers, 2, n_groups), dtype=np.float32)
+    all_biases = np.empty((n_layers, 2, n_groups), dtype=np.float32)
+
+    for layer in range(n_layers):
+        for kv_idx in range(2):
+            flat = np.ascontiguousarray(kv_f32[layer, kv_idx].ravel())
+            w, s, b = quantize_f32(flat)
+            all_weights[layer, kv_idx] = w
+            all_scales[layer, kv_idx] = s
+            all_biases[layer, kv_idx] = b
+
+    return Q4Bundle(
+        weights=all_weights,
+        scales=all_scales,
+        biases=all_biases,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        head_dim=head_dim,
+        seq_len=seq_len,
+        orig_dtype=orig_dtype,
+    )
+```
+
+**Step 3: Write _restore.py**
+
+```python
+"""High-level restore API with partial restore support."""
+
+from typing import Optional, Union
+import numpy as np
+from numpy.typing import NDArray
+
+from ._bundle import Q4Bundle
+from ._ops import dequantize_f32, dequantize_range_f32
+
+
+def dequantize(bundle: Q4Bundle) -> NDArray:
+    """Full dequantize: restore entire KV cache.
+
+    Returns: shape (n_layers, 2, n_heads, seq_len, head_dim), dtype f32
+    """
+    return restore(bundle)
+
+
+def restore(
+    bundle: Q4Bundle,
+    layers: Optional[Union[range, list, int]] = None,
+    tokens: Optional[Union[int, range, slice]] = None,
+    heads: Optional[Union[range, list, int]] = None,
+    out_dtype: str = "float32",
+) -> NDArray:
+    """Restore KV cache with optional partial selection.
+
+    Args:
+        bundle: Quantized KV cache
+        layers: Which layers to restore (None = all)
+        tokens: Which tokens to restore (negative = last N, None = all)
+        heads: Which heads to restore (None = all)
+        out_dtype: Output dtype ("float32" or "float16")
+    """
+    # Resolve layer indices
+    if layers is None:
+        layer_indices = list(range(bundle.n_layers))
+    elif isinstance(layers, int):
+        layer_indices = [layers]
+    else:
+        layer_indices = list(layers)
+
+    # Resolve head indices
+    if heads is None:
+        head_indices = list(range(bundle.n_heads))
+    elif isinstance(heads, int):
+        head_indices = [heads]
+    else:
+        head_indices = list(heads)
+
+    # Resolve token range
+    if tokens is None:
+        token_start, token_count = 0, bundle.seq_len
+    elif isinstance(tokens, int):
+        if tokens < 0:
+            token_start = bundle.seq_len + tokens
+            token_count = -tokens
+        else:
+            token_start = 0
+            token_count = tokens
+    elif isinstance(tokens, (range, slice)):
+        start = tokens.start or 0
+        stop = tokens.stop or bundle.seq_len
+        if start < 0:
+            start = bundle.seq_len + start
+        if stop < 0:
+            stop = bundle.seq_len + stop
+        token_start = start
+        token_count = stop - start
+    else:
+        raise ValueError(f"Unsupported tokens type: {type(tokens)}")
+
+    # Full restore fast path (no head/token slicing)
+    if (len(layer_indices) == bundle.n_layers
+            and len(head_indices) == bundle.n_heads
+            and token_start == 0 and token_count == bundle.seq_len):
+        return _full_restore(bundle, out_dtype)
+
+    # Partial restore
+    n_out_layers = len(layer_indices)
+    n_out_heads = len(head_indices)
+
+    out = np.empty(
+        (n_out_layers, 2, n_out_heads, token_count, bundle.head_dim),
+        dtype=np.float32,
+    )
+
+    for li, layer in enumerate(layer_indices):
+        for kv_idx in range(2):
+            # Full dequantize this layer/kv
+            full_flat = dequantize_f32(
+                bundle.weights[layer, kv_idx],
+                bundle.scales[layer, kv_idx],
+                bundle.biases[layer, kv_idx],
+            )
+            full = full_flat.reshape(bundle.n_heads, bundle.seq_len, bundle.head_dim)
+
+            # Slice heads and tokens
+            for hi, head in enumerate(head_indices):
+                out[li, kv_idx, hi] = full[head, token_start:token_start + token_count]
+
+    if out_dtype == "float16":
+        out = out.astype(np.float16)
+
+    return out
+
+
+def _full_restore(bundle: Q4Bundle, out_dtype: str) -> NDArray:
+    """Optimized path: restore everything."""
+    out = np.empty(
+        (bundle.n_layers, 2, bundle.n_heads, bundle.seq_len, bundle.head_dim),
+        dtype=np.float32,
+    )
+
+    for layer in range(bundle.n_layers):
+        for kv_idx in range(2):
+            flat = dequantize_f32(
+                bundle.weights[layer, kv_idx],
+                bundle.scales[layer, kv_idx],
+                bundle.biases[layer, kv_idx],
+            )
+            out[layer, kv_idx] = flat.reshape(bundle.n_heads, bundle.seq_len, bundle.head_dim)
+
+    if out_dtype == "float16":
+        out = out.astype(np.float16)
+
+    return out
+```
+
+**Step 4: Commit**
+
+```bash
+git add src/eakv/_bundle.py src/eakv/_quantize.py src/eakv/_restore.py
+git commit -m "feat: add Q4Bundle, quantize, and partial restore API"
+```
+
+---
+
+### Task 7: Roundtrip Tests
+
+**Files:**
+- Create: `tests/test_roundtrip.py`
+
+**Step 1: Write tests**
+
+```python
+"""Test Q4_1 quantize/dequantize roundtrip accuracy."""
+
+import numpy as np
+import pytest
+
+from eakv._quantize import quantize
+from eakv._restore import dequantize, restore
+
+
+def _make_kv_cache(n_layers=2, n_heads=4, seq_len=64, head_dim=64, seed=42):
+    """Create a random KV cache tensor."""
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal((n_layers, 2, n_heads, seq_len, head_dim)).astype(np.float32)
+
+
+class TestRoundtrip:
+    """Test quantize -> dequantize roundtrip."""
+
+    def test_basic_roundtrip(self):
+        kv = _make_kv_cache()
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        assert restored.shape == kv.shape
+        # Q4 has ~4-bit precision: max error should be within scale/15 per group
+        max_err = np.max(np.abs(kv - restored))
+        assert max_err < 0.5, f"Max error too large: {max_err}"
+
+    def test_bundle_metadata(self):
+        kv = _make_kv_cache(n_layers=4, n_heads=8, seq_len=128, head_dim=128)
+        bundle = quantize(kv)
+        assert bundle.n_layers == 4
+        assert bundle.n_heads == 8
+        assert bundle.seq_len == 128
+        assert bundle.head_dim == 128
+        assert bundle.orig_dtype == "float32"
+        assert bundle.compression_ratio < 0.35
+
+    def test_uniform_values(self):
+        """Uniform values should have near-zero error."""
+        kv = np.full((1, 2, 1, 64, 64), 3.14, dtype=np.float32)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        np.testing.assert_allclose(restored, kv, atol=1e-5)
+
+    def test_zero_values(self):
+        """All zeros should roundtrip exactly."""
+        kv = np.zeros((1, 2, 1, 64, 64), dtype=np.float32)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        np.testing.assert_allclose(restored, kv, atol=1e-6)
+
+    @pytest.mark.parametrize("seq_len", [64, 128, 256, 512])
+    def test_various_seq_lengths(self, seq_len):
+        kv = _make_kv_cache(seq_len=seq_len)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        assert restored.shape == kv.shape
+        max_err = np.max(np.abs(kv - restored))
+        assert max_err < 0.5
+
+
+class TestPartialRestore:
+    """Test partial restore with layer/token/head selection."""
+
+    def test_layer_selection(self):
+        kv = _make_kv_cache(n_layers=4)
+        bundle = quantize(kv)
+        partial = restore(bundle, layers=[0, 2])
+        assert partial.shape[0] == 2  # 2 layers
+        full = dequantize(bundle)
+        np.testing.assert_array_equal(partial[0], full[0])
+        np.testing.assert_array_equal(partial[1], full[2])
+
+    def test_last_n_tokens(self):
+        kv = _make_kv_cache(seq_len=256)
+        bundle = quantize(kv)
+        partial = restore(bundle, tokens=-64)
+        assert partial.shape[3] == 64  # last 64 tokens
+        full = dequantize(bundle)
+        np.testing.assert_array_equal(partial, full[:, :, :, -64:, :])
+
+    def test_head_selection(self):
+        kv = _make_kv_cache(n_heads=8)
+        bundle = quantize(kv)
+        partial = restore(bundle, heads=[0, 3, 7])
+        assert partial.shape[2] == 3
+        full = dequantize(bundle)
+        np.testing.assert_array_equal(partial[:, :, 0], full[:, :, 0])
+        np.testing.assert_array_equal(partial[:, :, 1], full[:, :, 3])
+        np.testing.assert_array_equal(partial[:, :, 2], full[:, :, 7])
+
+    def test_combined_partial(self):
+        kv = _make_kv_cache(n_layers=4, n_heads=8, seq_len=256)
+        bundle = quantize(kv)
+        partial = restore(bundle, layers=[1], tokens=-128, heads=[0, 4])
+        assert partial.shape == (1, 2, 2, 128, 64)
+
+    def test_out_dtype_f16(self):
+        kv = _make_kv_cache()
+        bundle = quantize(kv)
+        restored = restore(bundle, out_dtype="float16")
+        assert restored.dtype == np.float16
+
+
+class TestInputValidation:
+    """Test error handling for bad inputs."""
+
+    def test_wrong_ndim(self):
+        with pytest.raises(ValueError, match="5D"):
+            quantize(np.zeros((2, 3), dtype=np.float32))
+
+    def test_wrong_kv_dim(self):
+        with pytest.raises(ValueError, match="axis 1"):
+            quantize(np.zeros((2, 3, 4, 64, 64), dtype=np.float32))
+
+    def test_not_multiple_of_64(self):
+        with pytest.raises(ValueError, match="multiple of 64"):
+            quantize(np.zeros((1, 2, 1, 63, 1), dtype=np.float32))
+```
+
+**Step 2: Run tests**
+
+```bash
+cd /root/dev/eakv && python -m pytest tests/test_roundtrip.py -v
+```
+
+Expected: All pass.
+
+**Step 3: Commit**
+
+```bash
+git add tests/test_roundtrip.py
+git commit -m "test: add roundtrip and partial restore tests"
+```
+
+---
+
+### Task 8: Validate and Append Kernels
+
+**Files:**
+- Create: `kernels/validate.ea`
+- Create: `kernels/append.ea`
+- Modify: `src/eakv/_ops.py` — add validate/append wrappers
+
+**Step 1: Write validate.ea**
+
+```ea
+export func q4_validate(
+    weights: *restrict u8,
+    scales: *restrict f32,
+    biases: *restrict f32,
+    n_groups: i32
+) -> i32 {
+    let mut g: i32 = 0
+    while g < n_groups {
+        let s: f32 = scales[g]
+        let b: f32 = biases[g]
+
+        // Check for NaN or Inf in scales/biases
+        if s != s { return 1 }   // NaN check
+        if b != b { return 2 }   // NaN check
+
+        // Check scale is non-negative
+        if s < 0.0 { return 3 }
+
+        // Check packed weights: each nibble must be 0-15 (always true for 4-bit, but
+        // check for corrupted high bits if stored in wider types)
+        let w_base: i32 = g * 32
+        let mut k: i32 = 0
+        while k < 32 {
+            let byte_val: i32 = weights[w_base + k]
+            if byte_val < 0 { return 4 }
+            if byte_val > 255 { return 5 }
+            k = k + 1
+        }
+
+        g = g + 1
+    }
+    return 0
+}
+```
+
+**Step 2: Write append.ea**
+
+```ea
+export func q4_append_token_f32(
+    src_token: *restrict f32,
+    weights: *mut u8,
+    scales: *mut f32,
+    biases: *mut f32,
+    position: i32,
+    head_dim: i32
+) {
+    // Each token contributes head_dim values per head.
+    // This appends one token's worth of data at the given position.
+    // The caller is responsible for ensuring the buffer is large enough
+    // and for calling this once per head.
+
+    // Determine which group(s) this token falls into.
+    // Group boundaries: elements [g*64 .. (g+1)*64)
+    // Token position maps to elements: position*head_dim .. (position+1)*head_dim
+
+    let elem_start: i32 = position * head_dim
+    let elem_end: i32 = elem_start + head_dim
+
+    // For each group touched by this token range
+    let g_start: i32 = elem_start / 64
+    let g_end: i32 = (elem_end - 1) / 64
+
+    // Re-quantize affected groups
+    // Note: this requires reading back existing values in the group,
+    // which means we need the full float values. For v0.1, the caller
+    // should pass the complete group's float data.
+    // This is a simplified version that only works when head_dim is
+    // a multiple of 64 (one token = exact groups).
+
+    let mut g: i32 = g_start
+    while g <= g_end {
+        let group_base: i32 = g * 64
+        let token_offset: i32 = group_base - elem_start
+
+        // Find min/max of the new values in this group
+        let local_start: i32 = if group_base > elem_start { group_base } else { elem_start }
+        let local_end: i32 = if (g + 1) * 64 < elem_end { (g + 1) * 64 } else { elem_end }
+        let count: i32 = local_end - local_start
+
+        let mut min_val: f32 = src_token[local_start - elem_start]
+        let mut max_val: f32 = min_val
+        let mut j: i32 = 1
+        while j < count {
+            let v: f32 = src_token[local_start - elem_start + j]
+            if v < min_val { min_val = v }
+            if v > max_val { max_val = v }
+            j = j + 1
+        }
+
+        let range: f32 = max_val - min_val
+        let scale: f32 = if range > 0.0 { range / 15.0 } else { 1.0 }
+        let inv_scale: f32 = if range > 0.0 { 15.0 / range } else { 0.0 }
+        let bias: f32 = min_val
+
+        scales[g] = scale
+        biases[g] = bias
+
+        let w_base: i32 = g * 32
+        let src_base: i32 = local_start - elem_start
+        let mut k: i32 = 0
+        while k < count {
+            let v: f32 = (src_token[src_base + k] - bias) * inv_scale
+            let mut q: i32 = float_to_int(v + 0.5)
+            if q < 0 { q = 0 }
+            if q > 15 { q = 15 }
+
+            let byte_idx: i32 = (local_start - group_base + k) / 2
+            let is_high: i32 = (local_start - group_base + k) % 2
+            if is_high == 1 {
+                weights[w_base + byte_idx] = (weights[w_base + byte_idx] & 15) | (q << 4)
+            } else {
+                weights[w_base + byte_idx] = (weights[w_base + byte_idx] & 240) | q
+            }
+            k = k + 1
+        }
+
+        g = g + 1
+    }
+}
+```
+
+**Note:** The append kernel is complex. If Ea syntax doesn't support all these constructs (ternary if, modulo, etc.), simplify: handle only the case where `head_dim` is a multiple of 64, making each token map to exact groups. This is the common case (head_dim=64 or 128).
+
+**Step 3: Compile both kernels**
+
+```bash
+cd /root/dev/eakv && ./build_kernels.sh
+```
+
+**Step 4: Add validate and append wrappers to _ops.py**
+
+Add to end of `_ops.py`:
+
+```python
+# --- validate ---
+_lib_validate = load_library("validate")
+_q4_validate = _lib_validate.q4_validate
+_q4_validate.restype = ctypes.c_int32
+_q4_validate.argtypes = [
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int32,
+]
+
+
+def validate(weights: NDArray, scales: NDArray, biases: NDArray) -> int:
+    """Validate Q4 data. Returns 0 if ok, error code otherwise."""
+    n_groups = len(scales)
+    return _q4_validate(_ptr_u8(weights), _ptr_f32(scales), _ptr_f32(biases), n_groups)
+```
+
+**Step 5: Write tests for validate**
+
+Create `tests/test_validate.py`:
+
+```python
+import numpy as np
+import pytest
+from eakv._quantize import quantize
+from eakv._ops import validate
+
+
+def test_valid_bundle():
+    kv = np.random.randn(1, 2, 1, 64, 64).astype(np.float32)
+    bundle = quantize(kv)
+    assert validate(bundle.weights[0, 0], bundle.scales[0, 0], bundle.biases[0, 0]) == 0
+
+
+def test_nan_scale():
+    kv = np.random.randn(1, 2, 1, 64, 64).astype(np.float32)
+    bundle = quantize(kv)
+    bundle.scales[0, 0, 0] = float('nan')
+    assert validate(bundle.weights[0, 0], bundle.scales[0, 0], bundle.biases[0, 0]) != 0
+
+
+def test_nan_bias():
+    kv = np.random.randn(1, 2, 1, 64, 64).astype(np.float32)
+    bundle = quantize(kv)
+    bundle.biases[0, 0, 0] = float('nan')
+    assert validate(bundle.weights[0, 0], bundle.scales[0, 0], bundle.biases[0, 0]) != 0
+```
+
+**Step 6: Run all tests**
+
+```bash
+cd /root/dev/eakv && python -m pytest tests/ -v
+```
+
+**Step 7: Commit**
+
+```bash
+git add kernels/validate.ea kernels/append.ea src/eakv/_ops.py tests/test_validate.py
+git commit -m "feat: add validate and append kernels"
+```
+
+---
+
+### Task 9: File I/O with mmap Support
+
+**Files:**
+- Create: `src/eakv/_io.py`
+- Create: `tests/test_io.py`
+
+**Step 1: Write tests first**
+
+```python
+"""Test .eakv file format save/load/mmap."""
+
+import tempfile
+import numpy as np
+import pytest
+
+from eakv._quantize import quantize
+from eakv._restore import dequantize
+from eakv._io import save, load, open_mmap
+
+
+def _make_bundle():
+    kv = np.random.default_rng(42).standard_normal((2, 2, 4, 64, 64)).astype(np.float32)
+    return quantize(kv), kv
+
+
+class TestSaveLoad:
+    def test_roundtrip(self, tmp_path):
+        bundle, kv = _make_bundle()
+        path = tmp_path / "test.eakv"
+        save(bundle, str(path))
+        loaded = load(str(path))
+        restored = dequantize(loaded)
+        original = dequantize(bundle)
+        np.testing.assert_array_equal(restored, original)
+
+    def test_metadata_preserved(self, tmp_path):
+        bundle, _ = _make_bundle()
+        bundle.model_hash = "abc123"
+        bundle.tokenizer_hash = "def456"
+        path = tmp_path / "test.eakv"
+        save(bundle, str(path))
+        loaded = load(str(path))
+        assert loaded.n_layers == bundle.n_layers
+        assert loaded.n_heads == bundle.n_heads
+        assert loaded.seq_len == bundle.seq_len
+        assert loaded.head_dim == bundle.head_dim
+        assert loaded.model_hash == "abc123"
+        assert loaded.tokenizer_hash == "def456"
+
+    def test_file_starts_with_magic(self, tmp_path):
+        bundle, _ = _make_bundle()
+        path = tmp_path / "test.eakv"
+        save(bundle, str(path))
+        with open(str(path), "rb") as f:
+            assert f.read(4) == b"EAKV"
+
+    def test_bad_magic_raises(self, tmp_path):
+        path = tmp_path / "bad.eakv"
+        path.write_bytes(b"NOPE" + b"\x00" * 508)
+        with pytest.raises(ValueError, match="magic"):
+            load(str(path))
+
+
+class TestMmap:
+    def test_mmap_restore(self, tmp_path):
+        bundle, _ = _make_bundle()
+        path = tmp_path / "test.eakv"
+        save(bundle, str(path))
+        with open_mmap(str(path)) as mmapped:
+            restored = dequantize(mmapped)
+            original = dequantize(bundle)
+            np.testing.assert_array_equal(restored, original)
+
+    def test_mmap_metadata(self, tmp_path):
+        bundle, _ = _make_bundle()
+        path = tmp_path / "test.eakv"
+        save(bundle, str(path))
+        with open_mmap(str(path)) as mmapped:
+            assert mmapped.n_layers == bundle.n_layers
+            assert mmapped.n_heads == bundle.n_heads
+```
+
+**Step 2: Run tests (should fail — _io not implemented yet)**
+
+```bash
+cd /root/dev/eakv && python -m pytest tests/test_io.py -v 2>&1 | head -5
+```
+
+Expected: ImportError
+
+**Step 3: Write _io.py**
+
+```python
+"""File I/O for .eakv format with mmap support."""
+
+import struct
+import mmap
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Optional
+import numpy as np
+
+from ._bundle import Q4Bundle
+
+# Header format: 512 bytes total
+# All integers little-endian
+MAGIC = b"EAKV"
+HEADER_SIZE = 512
+LAYER_INDEX_ENTRY_SIZE = 16  # 2 x u64 per layer (K_offset, V_offset)
+
+# Header struct layout (after magic):
+#   version: u16
+#   quant_scheme: u16
+#   group_size: u32
+#   orig_dtype: u16  (0=f32, 1=f16)
+#   n_layers: u32
+#   n_heads: u32
+#   head_dim: u32
+#   seq_len: u32
+#   max_seq_len: u32
+#   compression: u16
+#   model_hash: 32 bytes (utf-8, zero-padded)
+#   tokenizer_hash: 32 bytes (utf-8, zero-padded)
+#   checksum: u64
+HEADER_STRUCT = struct.Struct("<HHIHIIIIIh32s32sQ")
+
+
+def _align64(offset: int) -> int:
+    """Round up to next 64-byte boundary."""
+    return (offset + 63) & ~63
+
+
+def _encode_hash(h: Optional[str]) -> bytes:
+    if h is None:
+        return b"\x00" * 32
+    encoded = h.encode("utf-8")[:32]
+    return encoded.ljust(32, b"\x00")
+
+
+def _decode_hash(b: bytes) -> Optional[str]:
+    stripped = b.rstrip(b"\x00")
+    return stripped.decode("utf-8") if stripped else None
+
+
+def save(
+    bundle: Q4Bundle,
+    path: str,
+    compress: Optional[str] = None,
+    model_hash: Optional[str] = None,
+    tokenizer_hash: Optional[str] = None,
+) -> None:
+    """Save Q4Bundle to .eakv file.
+
+    Args:
+        bundle: The quantized KV cache
+        path: Output file path
+        compress: Optional compression ("zstd" or None)
+        model_hash: Override bundle's model_hash
+        tokenizer_hash: Override bundle's tokenizer_hash
+    """
+    mh = model_hash or bundle.model_hash
+    th = tokenizer_hash or bundle.tokenizer_hash
+
+    dtype_code = 0 if bundle.orig_dtype == "float32" else 1
+    compression_code = 0
+    if compress == "zstd":
+        try:
+            import zstandard
+            compression_code = 1
+        except ImportError:
+            raise ImportError("Install zstandard: pip install eakv[compress]")
+
+    # Build header
+    header_data = HEADER_STRUCT.pack(
+        1,                      # version
+        0,                      # quant_scheme (Q4_1)
+        64,                     # group_size
+        dtype_code,
+        bundle.n_layers,
+        bundle.n_heads,
+        bundle.head_dim,
+        bundle.seq_len,
+        bundle.seq_len,         # max_seq_len = seq_len for now
+        compression_code,
+        _encode_hash(mh),
+        _encode_hash(th),
+        0,                      # checksum (filled later)
+    )
+
+    header = MAGIC + header_data
+    header = header.ljust(HEADER_SIZE, b"\x00")
+
+    # Build layer index + data
+    n_groups = bundle.n_groups_per_layer
+    weight_bytes = n_groups * 32
+    scale_bytes = n_groups * 4
+    bias_bytes = n_groups * 4
+    layer_kv_size = weight_bytes + scale_bytes + bias_bytes
+
+    # Layer index comes right after header
+    index_size = bundle.n_layers * 2 * 8  # 2 u64 per layer
+    data_start = _align64(HEADER_SIZE + index_size)
+
+    layer_index = bytearray()
+    data_sections = bytearray()
+
+    for layer in range(bundle.n_layers):
+        k_offset = data_start + len(data_sections)
+        # K data
+        data_sections.extend(bundle.weights[layer, 0].tobytes())
+        data_sections.extend(bundle.scales[layer, 0].tobytes())
+        data_sections.extend(bundle.biases[layer, 0].tobytes())
+        # Align
+        pad = _align64(len(data_sections) + data_start) - (len(data_sections) + data_start)
+        data_sections.extend(b"\x00" * pad)
+
+        v_offset = data_start + len(data_sections)
+        # V data
+        data_sections.extend(bundle.weights[layer, 1].tobytes())
+        data_sections.extend(bundle.scales[layer, 1].tobytes())
+        data_sections.extend(bundle.biases[layer, 1].tobytes())
+        # Align
+        pad = _align64(len(data_sections) + data_start) - (len(data_sections) + data_start)
+        data_sections.extend(b"\x00" * pad)
+
+        layer_index.extend(struct.pack("<QQ", k_offset, v_offset))
+
+    # Pad index to align
+    index_padded = bytes(layer_index).ljust(data_start - HEADER_SIZE, b"\x00")
+
+    with open(path, "wb") as f:
+        f.write(header)
+        f.write(index_padded)
+        if compression_code == 1:
+            import zstandard
+            cctx = zstandard.ZstdCompressor(level=3)
+            f.write(cctx.compress(bytes(data_sections)))
+        else:
+            f.write(bytes(data_sections))
+
+
+def load(path: str) -> Q4Bundle:
+    """Load Q4Bundle from .eakv file."""
+    with open(path, "rb") as f:
+        data = f.read()
+    return _parse(data)
+
+
+def _parse(data: bytes | memoryview) -> Q4Bundle:
+    """Parse .eakv format from bytes."""
+    if data[:4] != MAGIC:
+        raise ValueError(f"Bad magic bytes: expected EAKV, got {data[:4]!r}")
+
+    vals = HEADER_STRUCT.unpack_from(data, 4)
+    (version, quant_scheme, group_size, dtype_code,
+     n_layers, n_heads, head_dim, seq_len, max_seq_len,
+     compression, model_hash_raw, tokenizer_hash_raw, checksum) = vals
+
+    orig_dtype = "float32" if dtype_code == 0 else "float16"
+    model_hash = _decode_hash(model_hash_raw)
+    tokenizer_hash = _decode_hash(tokenizer_hash_raw)
+
+    # Read layer index
+    index_offset = HEADER_SIZE
+    layer_offsets = []
+    for i in range(n_layers):
+        k_off, v_off = struct.unpack_from("<QQ", data, index_offset + i * 16)
+        layer_offsets.append((k_off, v_off))
+
+    # Decompress if needed
+    if compression == 1:
+        import zstandard
+        dctx = zstandard.ZstdDecompressor()
+        data_start = _align64(HEADER_SIZE + n_layers * 16)
+        decompressed = dctx.decompress(data[data_start:])
+        # Adjust offsets: subtract data_start since decompressed starts at 0
+        adjusted_offsets = [(k - data_start, v - data_start) for k, v in layer_offsets]
+        return _extract_bundle(decompressed, adjusted_offsets, n_layers, n_heads, head_dim, seq_len, orig_dtype, model_hash, tokenizer_hash)
+
+    return _extract_bundle(data, layer_offsets, n_layers, n_heads, head_dim, seq_len, orig_dtype, model_hash, tokenizer_hash)
+
+
+def _extract_bundle(data, layer_offsets, n_layers, n_heads, head_dim, seq_len, orig_dtype, model_hash, tokenizer_hash):
+    """Extract arrays from raw bytes given layer offsets."""
+    elements_per = n_heads * head_dim * seq_len
+    n_groups = elements_per // 64
+    w_bytes = n_groups * 32
+    s_bytes = n_groups * 4
+    b_bytes = n_groups * 4
+
+    all_w = np.empty((n_layers, 2, w_bytes), dtype=np.uint8)
+    all_s = np.empty((n_layers, 2, n_groups), dtype=np.float32)
+    all_b = np.empty((n_layers, 2, n_groups), dtype=np.float32)
+
+    for layer, (k_off, v_off) in enumerate(layer_offsets):
+        for kv_idx, off in enumerate((k_off, v_off)):
+            buf = data[off:] if isinstance(data, (bytes, bytearray)) else data[off:]
+            all_w[layer, kv_idx] = np.frombuffer(buf[:w_bytes], dtype=np.uint8).copy()
+            all_s[layer, kv_idx] = np.frombuffer(buf[w_bytes:w_bytes + s_bytes], dtype=np.float32).copy()
+            all_b[layer, kv_idx] = np.frombuffer(buf[w_bytes + s_bytes:w_bytes + s_bytes + b_bytes], dtype=np.float32).copy()
+
+    return Q4Bundle(
+        weights=all_w, scales=all_s, biases=all_b,
+        n_layers=n_layers, n_heads=n_heads, head_dim=head_dim,
+        seq_len=seq_len, orig_dtype=orig_dtype,
+        model_hash=model_hash, tokenizer_hash=tokenizer_hash,
+    )
+
+
+@contextmanager
+def open_mmap(path: str):
+    """Memory-map an .eakv file. Yields a Q4Bundle backed by mmap'd memory."""
+    f = open(path, "rb")
+    try:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            bundle = _parse(mm)
+            yield bundle
+        finally:
+            mm.close()
+    finally:
+        f.close()
+```
+
+**Step 4: Run tests**
+
+```bash
+cd /root/dev/eakv && python -m pytest tests/test_io.py -v
+```
+
+**Step 5: Commit**
+
+```bash
+git add src/eakv/_io.py tests/test_io.py
+git commit -m "feat: add .eakv file format with save/load/mmap"
+```
+
+---
+
+### Task 10: Public API (__init__.py)
+
+**Files:**
+- Modify: `src/eakv/__init__.py`
+
+**Step 1: Write __init__.py**
+
+```python
+"""eakv: Fast Q4 KV cache quantization and restore for LLM inference."""
+
+from ._bundle import Q4Bundle
+from ._quantize import quantize
+from ._restore import dequantize, restore
+from ._io import save, load, open_mmap
+from ._ops import validate
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "Q4Bundle",
+    "quantize",
+    "dequantize",
+    "restore",
+    "save",
+    "load",
+    "open_mmap",
+    "validate",
+]
+
+
+def append(bundle: Q4Bundle, token_kv, position: int) -> None:
+    """Append a new token's KV to the bundle (re-quantizes affected groups).
+
+    Args:
+        bundle: The Q4Bundle to append to
+        token_kv: shape (n_layers, 2, n_heads, 1, head_dim), dtype f32
+        position: Token position to write at
+    """
+    import numpy as np
+    from ._ops import quantize_f32
+
+    if token_kv.ndim != 5 or token_kv.shape[3] != 1:
+        raise ValueError("token_kv must have shape (n_layers, 2, n_heads, 1, head_dim)")
+
+    # For v0.1: re-quantize the affected groups per layer/kv
+    # This is correct but not maximally efficient — the append kernel
+    # will optimize this in a future version
+    for layer in range(bundle.n_layers):
+        for kv_idx in range(2):
+            # Dequantize current data
+            from ._ops import dequantize_f32
+            flat = dequantize_f32(
+                bundle.weights[layer, kv_idx],
+                bundle.scales[layer, kv_idx],
+                bundle.biases[layer, kv_idx],
+            )
+            full = flat.reshape(bundle.n_heads, bundle.seq_len, bundle.head_dim)
+
+            # Insert new token
+            expanded = np.zeros(
+                (bundle.n_heads, bundle.seq_len + 1, bundle.head_dim),
+                dtype=np.float32,
+            )
+            expanded[:, :bundle.seq_len, :] = full
+            expanded[:, position, :] = token_kv[layer, kv_idx, :, 0, :]
+
+            # Re-quantize
+            new_flat = np.ascontiguousarray(expanded[:, :bundle.seq_len + 1].ravel())
+            # Only if the new size fits; otherwise this needs buffer reallocation
+            # For v0.1, we require position < seq_len (overwrite, not extend)
+            if position < bundle.seq_len:
+                rewrite_flat = np.ascontiguousarray(full.ravel())
+                rewrite_flat = rewrite_flat.copy()
+                # Overwrite at position
+                for h in range(bundle.n_heads):
+                    idx = h * bundle.seq_len * bundle.head_dim + position * bundle.head_dim
+                    rewrite_flat[idx:idx + bundle.head_dim] = token_kv[layer, kv_idx, h, 0]
+                w, s, b = quantize_f32(rewrite_flat)
+                bundle.weights[layer, kv_idx] = w
+                bundle.scales[layer, kv_idx] = s
+                bundle.biases[layer, kv_idx] = b
+
+    if position >= bundle.seq_len:
+        bundle.seq_len = position + 1
+```
+
+**Step 2: Test public API imports**
+
+```bash
+cd /root/dev/eakv && python -c "
+import eakv
+print(f'eakv v{eakv.__version__}')
+print(f'API: {eakv.__all__}')
+"
+```
+
+**Step 3: Commit**
+
+```bash
+git add src/eakv/__init__.py
+git commit -m "feat: add public API with all exports"
+```
+
+---
+
+### Task 11: Integration Test (Full Workflow)
+
+**Files:**
+- Create: `tests/test_integration.py`
+
+**Step 1: Write integration test**
+
+```python
+"""End-to-end integration test: quantize -> save -> mmap -> partial restore."""
+
+import tempfile
+import numpy as np
+import pytest
+
+import eakv
+
+
+def test_full_workflow():
+    """The demo workflow from the README."""
+    rng = np.random.default_rng(42)
+
+    # Simulate an 8-layer, 4-head, 128-token, 64-dim KV cache
+    kv_cache = rng.standard_normal((8, 2, 4, 128, 64)).astype(np.float32)
+
+    # Quantize
+    bundle = eakv.quantize(kv_cache)
+    assert bundle.n_layers == 8
+    assert bundle.compression_ratio < 0.35
+
+    # Validate
+    eakv.validate(bundle)
+
+    # Save
+    with tempfile.NamedTemporaryFile(suffix=".eakv") as f:
+        eakv.save(bundle, f.name)
+
+        # Load and full restore
+        loaded = eakv.load(f.name)
+        full = eakv.dequantize(loaded)
+        assert full.shape == kv_cache.shape
+        max_err = np.max(np.abs(full - kv_cache))
+        assert max_err < 0.5
+
+        # Mmap and partial restore
+        with eakv.open_mmap(f.name) as mmapped:
+            # Last 64 tokens, layers 0-3 only
+            partial = eakv.restore(mmapped, layers=range(4), tokens=-64)
+            assert partial.shape == (4, 2, 4, 64, 64)
+
+            # Single layer, single head
+            single = eakv.restore(mmapped, layers=0, heads=0)
+            assert single.shape == (1, 2, 1, 128, 64)
+
+
+def test_compression_ratio():
+    """Verify storage savings match design expectations."""
+    kv = np.random.randn(32, 2, 32, 128, 128).astype(np.float32)
+    bundle = eakv.quantize(kv)
+
+    # Q4_1: 40 bytes per 64 elements = 0.625 bytes/element
+    # f32: 4 bytes/element
+    # Ratio: ~15.6%
+    assert bundle.compression_ratio < 0.20
+    assert bundle.compression_ratio > 0.10
+```
+
+**Step 2: Run all tests**
+
+```bash
+cd /root/dev/eakv && python -m pytest tests/ -v
+```
+
+**Step 3: Commit**
+
+```bash
+git add tests/test_integration.py
+git commit -m "test: add end-to-end integration tests"
+```
+
+---
+
+### Task 12: Benchmark Script
+
+**Files:**
+- Create: `benchmarks/bench_roundtrip.py`
+
+**Step 1: Write benchmark**
+
+```python
+"""Benchmark: quantize/restore times for various KV cache sizes.
+
+Usage: python benchmarks/bench_roundtrip.py
+"""
+
+import time
+import tempfile
+import numpy as np
+import eakv
+
+
+def bench(name: str, fn, warmup=1, runs=5):
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+    avg = np.mean(times)
+    std = np.std(times)
+    print(f"  {name}: {avg*1000:.1f}ms +/- {std*1000:.1f}ms")
+    return avg
+
+
+def main():
+    configs = [
+        # (name, n_layers, n_heads, seq_len, head_dim)
+        ("Small (1B-like)", 12, 8, 512, 64),
+        ("Medium (7B-like)", 32, 8, 2048, 128),
+        ("Large (8B-like)", 32, 32, 4096, 128),
+    ]
+
+    for name, nl, nh, sl, hd in configs:
+        print(f"\n{'='*60}")
+        print(f"{name}: {nl} layers, {nh} heads, {sl} seq, {hd} dim")
+
+        kv = np.random.randn(nl, 2, nh, sl, hd).astype(np.float32)
+        size_mb = kv.nbytes / 1024 / 1024
+        print(f"  Original size: {size_mb:.1f} MB")
+
+        # Quantize
+        t_q = bench("Quantize", lambda: eakv.quantize(kv))
+        bundle = eakv.quantize(kv)
+        comp_mb = bundle.compressed_size / 1024 / 1024
+        print(f"  Compressed size: {comp_mb:.1f} MB ({bundle.compression_ratio:.1%})")
+
+        # Full restore
+        t_r = bench("Full restore", lambda: eakv.dequantize(bundle))
+
+        # Partial restore (last 256 tokens)
+        if sl >= 256:
+            bench("Partial restore (last 256 tokens)", lambda: eakv.restore(bundle, tokens=-256))
+
+        # Save/load
+        with tempfile.NamedTemporaryFile(suffix=".eakv") as f:
+            bench("Save to disk", lambda: eakv.save(bundle, f.name))
+            bench("Load from disk", lambda: eakv.load(f.name))
+
+            eakv.save(bundle, f.name)
+            bench("Mmap open + restore", lambda: _mmap_restore(f.name))
+
+        print(f"  Simulated prefill skip: {t_q*1000:.0f}ms quantize, {t_r*1000:.0f}ms restore")
+
+
+def _mmap_restore(path):
+    with eakv.open_mmap(path) as b:
+        return eakv.dequantize(b)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Step 2: Run benchmark**
+
+```bash
+cd /root/dev/eakv && python benchmarks/bench_roundtrip.py
+```
+
+**Step 3: Commit**
+
+```bash
+git add benchmarks/bench_roundtrip.py
+git commit -m "feat: add roundtrip benchmark suite"
+```
+
+---
+
+### Task 13: Final Verification + Git Tag
+
+**Step 1: Run full test suite**
+
+```bash
+cd /root/dev/eakv && python -m pytest tests/ -v --tb=short
+```
+
+Expected: All tests pass.
+
+**Step 2: Test pip install**
+
+```bash
+cd /root/dev/eakv && pip install -e ".[dev]"
+python -c "import eakv; print(f'eakv {eakv.__version__} ready')"
+```
+
+**Step 3: Run benchmark to capture numbers**
+
+```bash
+python benchmarks/bench_roundtrip.py
+```
+
+**Step 4: Commit any remaining files and tag**
+
+```bash
+git add -A
+git status
+# Only commit if there are changes
+git tag v0.1.0
+```
+
+---
+
+## Summary
+
+| Task | What | Key files |
+|------|------|-----------|
+| 1 | Scaffolding | pyproject.toml, dirs |
+| 2 | Quantize kernel | kernels/quantize.ea |
+| 3 | Dequantize kernel (hot path) | kernels/dequantize.ea |
+| 4 | Build script + loader | build_kernels.sh, _loader.py |
+| 5 | Python ops layer | _ops.py |
+| 6 | Q4Bundle + quantize/restore API | _bundle.py, _quantize.py, _restore.py |
+| 7 | Roundtrip tests | tests/test_roundtrip.py |
+| 8 | Validate + append kernels | kernels/validate.ea, kernels/append.ea |
+| 9 | File I/O + mmap | _io.py, tests/test_io.py |
+| 10 | Public API | __init__.py |
+| 11 | Integration tests | tests/test_integration.py |
+| 12 | Benchmarks | benchmarks/bench_roundtrip.py |
+| 13 | Final verification + tag | v0.1.0 |
+
+**Critical path:** Tasks 2-3 (Ea kernels) are the riskiest — Ea syntax for integer ops and byte-level access needs validation against the compiler. Everything else follows eavec patterns closely.
+
+**Ea syntax risks to resolve early:**
+- `float_to_int` / `int_to_float` conversion intrinsics
+- `u8` pointer load/store support
+- Conditional expressions (`if/else` as expression vs statement)
+- Bitwise shift on scalar integers (`<<`, `>>`)
+- Modulo operator (`%`)
