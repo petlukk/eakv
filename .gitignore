@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.so
+*.dll
+*.o
+*.ea.json
+.pytest_cache/
