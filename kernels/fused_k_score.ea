@@ -1,0 +1,96 @@
+// Fused K-score: dot(query, dequant(K)) per sequence position
+//
+// For each position t (head_dim=128, 2 groups per position):
+//   Load packed K bytes, dequant inline, dot with query vector.
+//   Eliminates intermediate f32 store — dequantized values stay in registers.
+//
+// Uses vector accumulation: all 8 partial products accumulate in a single
+// f32x16 via FMA, with one reduce_add at the end per position.
+
+export func q4_fused_k_score_f32(
+    q_vec:    *restrict f32,
+    k_packed: *restrict u8,
+    k_scales: *restrict f32,
+    k_biases: *restrict f32,
+    scores:   *mut f32,
+    seq_len:  i32
+) {
+    let mask15: u8x16 = splat(15)
+    let div16: u8x16 = splat(16)
+    let zero16: f32x16 = splat(0.0)
+
+    // Precompute 1/sqrt(128)
+    let rsqrt_d: f32 = 1.0 / sqrt(to_f32(128))
+
+    // Preload Q vector (128 f32 = 8 x f32x16, stays in registers)
+    let q0: f32x16 = load(q_vec, 0)
+    let q1: f32x16 = load(q_vec, 16)
+    let q2: f32x16 = load(q_vec, 32)
+    let q3: f32x16 = load(q_vec, 48)
+    let q4: f32x16 = load(q_vec, 64)
+    let q5: f32x16 = load(q_vec, 80)
+    let q6: f32x16 = load(q_vec, 96)
+    let q7: f32x16 = load(q_vec, 112)
+
+    let mut t: i32 = 0
+    while t < seq_len {
+        // Accumulate all partial dot products in a single vector
+        let mut acc: f32x16 = zero16
+
+        // --- Group 0: dimensions 0-63 ---
+        let g0: i32 = t * 2
+        let vs0: f32x16 = splat(k_scales[g0])
+        let vb0: f32x16 = splat(k_biases[g0])
+        let wb0: i32 = g0 * 32
+
+        let p0a: u8x16 = load(k_packed, wb0)
+        let lo0a: u8x16 = p0a .& mask15
+        let hi0a: u8x16 = p0a ./ div16
+
+        let p0b: u8x16 = load(k_packed, wb0 + 16)
+        let lo0b: u8x16 = p0b .& mask15
+        let hi0b: u8x16 = p0b ./ div16
+
+        let d0: f32x16 = fma(widen_u8_f32x16(lo0a), vs0, vb0)
+        acc = fma(d0, q0, acc)
+
+        let d1: f32x16 = fma(widen_u8_f32x16(lo0b), vs0, vb0)
+        acc = fma(d1, q1, acc)
+
+        let d2: f32x16 = fma(widen_u8_f32x16(hi0a), vs0, vb0)
+        acc = fma(d2, q2, acc)
+
+        let d3: f32x16 = fma(widen_u8_f32x16(hi0b), vs0, vb0)
+        acc = fma(d3, q3, acc)
+
+        // --- Group 1: dimensions 64-127 ---
+        let g1: i32 = g0 + 1
+        let vs1: f32x16 = splat(k_scales[g1])
+        let vb1: f32x16 = splat(k_biases[g1])
+        let wb1: i32 = g1 * 32
+
+        let p1a: u8x16 = load(k_packed, wb1)
+        let lo1a: u8x16 = p1a .& mask15
+        let hi1a: u8x16 = p1a ./ div16
+
+        let p1b: u8x16 = load(k_packed, wb1 + 16)
+        let lo1b: u8x16 = p1b .& mask15
+        let hi1b: u8x16 = p1b ./ div16
+
+        let d4: f32x16 = fma(widen_u8_f32x16(lo1a), vs1, vb1)
+        acc = fma(d4, q4, acc)
+
+        let d5: f32x16 = fma(widen_u8_f32x16(lo1b), vs1, vb1)
+        acc = fma(d5, q5, acc)
+
+        let d6: f32x16 = fma(widen_u8_f32x16(hi1a), vs1, vb1)
+        acc = fma(d6, q6, acc)
+
+        let d7: f32x16 = fma(widen_u8_f32x16(hi1b), vs1, vb1)
+        acc = fma(d7, q7, acc)
+
+        // Single horizontal reduction per position
+        scores[t] = reduce_add(acc) * rsqrt_d
+        t = t + 1
+    }
+}

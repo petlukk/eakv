@@ -33,7 +33,7 @@ esac
 
 echo "Building eakv kernels (ea=$EA)..."
 
-for kernel in quantize dequantize dequantize_u8 validate; do
+for kernel in quantize dequantize dequantize_u8 validate quantize_simd dequantize_simd; do
     src="$KERNEL_DIR/${kernel}.ea"
     if [ ! -f "$src" ]; then
         echo "  WARNING: $src not found, skipping" >&2
@@ -71,5 +71,29 @@ for kernel in quantize dequantize dequantize_u8 validate; do
 
     echo "  -> _${kernel}_bind.py"
 done
+
+# Multi-ISA dequantize kernels (dispatched at runtime, no bindings needed)
+echo "  Compiling multi-ISA dequantize kernels..."
+
+# SSE (f32x4) — reuse dequantize_simd.ea with SSE-only output name
+"$EA" "$KERNEL_DIR/dequantize_simd.ea" --lib -o "$LIB_DIR/${PREFIX}dequantize_sse${EXT}"
+echo "    -> dequantize_sse (128-bit, f32x4)"
+
+# AVX2 (f32x8)
+"$EA" "$KERNEL_DIR/dequantize_avx2.ea" --lib -o "$LIB_DIR/${PREFIX}dequantize_avx2${EXT}"
+echo "    -> dequantize_avx2 (256-bit, f32x8)"
+
+# AVX-512 (f32x16)
+"$EA" "$KERNEL_DIR/dequantize_avx512.ea" --lib --avx512 -o "$LIB_DIR/${PREFIX}dequantize_avx512${EXT}"
+echo "    -> dequantize_avx512 (512-bit, f32x16)"
+
+# Fused attention kernels (AVX-512 only)
+echo "  Compiling fused attention kernels..."
+
+"$EA" "$KERNEL_DIR/fused_k_score.ea" --lib --avx512 -o "$LIB_DIR/${PREFIX}fused_k_score${EXT}"
+echo "    -> fused_k_score (AVX-512, fused K dot product)"
+
+"$EA" "$KERNEL_DIR/fused_v_sum.ea" --lib --avx512 -o "$LIB_DIR/${PREFIX}fused_v_sum${EXT}"
+echo "    -> fused_v_sum (AVX-512, fused V weighted sum)"
 
 echo "Done. Libraries in $LIB_DIR, bindings in $BIND_DIR"

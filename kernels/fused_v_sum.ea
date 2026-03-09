@@ -1,0 +1,88 @@
+// Fused V weighted sum: sum_t(weight[t] * dequant(V[t]))
+//
+// For each position t:
+//   Load packed V bytes, dequant inline, multiply by softmax weight,
+//   accumulate into output vector [128].
+//
+// Output vector (512 bytes) stays in L1 the entire time.
+// Caller must zero out_vec before calling.
+
+export func q4_fused_v_sum_f32(
+    weights:  *restrict f32,
+    v_packed: *restrict u8,
+    v_scales: *restrict f32,
+    v_biases: *restrict f32,
+    out_vec:  *mut f32,
+    seq_len:  i32
+) {
+    let mask15: u8x16 = splat(15)
+    let div16: u8x16 = splat(16)
+
+    let mut t: i32 = 0
+    while t < seq_len {
+        let vw: f32x16 = splat(weights[t])
+
+        // --- Group 0: dimensions 0-63 ---
+        let g0: i32 = t * 2
+        let vs0: f32x16 = splat(v_scales[g0])
+        let vb0: f32x16 = splat(v_biases[g0])
+        let wb0: i32 = g0 * 32
+
+        let p0a: u8x16 = load(v_packed, wb0)
+        let lo0a: u8x16 = p0a .& mask15
+        let hi0a: u8x16 = p0a ./ div16
+
+        let p0b: u8x16 = load(v_packed, wb0 + 16)
+        let lo0b: u8x16 = p0b .& mask15
+        let hi0b: u8x16 = p0b ./ div16
+
+        // Dequant, scale by weight, accumulate into output
+        let d0: f32x16 = fma(widen_u8_f32x16(lo0a), vs0, vb0)
+        let o0: f32x16 = load(out_vec, 0)
+        store(out_vec, 0, fma(d0, vw, o0))
+
+        let d1: f32x16 = fma(widen_u8_f32x16(lo0b), vs0, vb0)
+        let o1: f32x16 = load(out_vec, 16)
+        store(out_vec, 16, fma(d1, vw, o1))
+
+        let d2: f32x16 = fma(widen_u8_f32x16(hi0a), vs0, vb0)
+        let o2: f32x16 = load(out_vec, 32)
+        store(out_vec, 32, fma(d2, vw, o2))
+
+        let d3: f32x16 = fma(widen_u8_f32x16(hi0b), vs0, vb0)
+        let o3: f32x16 = load(out_vec, 48)
+        store(out_vec, 48, fma(d3, vw, o3))
+
+        // --- Group 1: dimensions 64-127 ---
+        let g1: i32 = g0 + 1
+        let vs1: f32x16 = splat(v_scales[g1])
+        let vb1: f32x16 = splat(v_biases[g1])
+        let wb1: i32 = g1 * 32
+
+        let p1a: u8x16 = load(v_packed, wb1)
+        let lo1a: u8x16 = p1a .& mask15
+        let hi1a: u8x16 = p1a ./ div16
+
+        let p1b: u8x16 = load(v_packed, wb1 + 16)
+        let lo1b: u8x16 = p1b .& mask15
+        let hi1b: u8x16 = p1b ./ div16
+
+        let d4: f32x16 = fma(widen_u8_f32x16(lo1a), vs1, vb1)
+        let o4: f32x16 = load(out_vec, 64)
+        store(out_vec, 64, fma(d4, vw, o4))
+
+        let d5: f32x16 = fma(widen_u8_f32x16(lo1b), vs1, vb1)
+        let o5: f32x16 = load(out_vec, 80)
+        store(out_vec, 80, fma(d5, vw, o5))
+
+        let d6: f32x16 = fma(widen_u8_f32x16(hi1a), vs1, vb1)
+        let o6: f32x16 = load(out_vec, 96)
+        store(out_vec, 96, fma(d6, vw, o6))
+
+        let d7: f32x16 = fma(widen_u8_f32x16(hi1b), vs1, vb1)
+        let o7: f32x16 = load(out_vec, 112)
+        store(out_vec, 112, fma(d7, vw, o7))
+
+        t = t + 1
+    }
+}
