@@ -4,7 +4,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ._bundle import Q4Bundle
-from ._ops import q4_quantize_f32
+from ._ops import q4_quantize_split_f32
 
 
 def quantize(kv_cache: NDArray) -> Q4Bundle:
@@ -55,7 +55,7 @@ def quantize(kv_cache: NDArray) -> Q4Bundle:
     for layer in range(n_layers):
         for kv_idx in range(2):
             flat = np.ascontiguousarray(kv_f32[layer, kv_idx].ravel())
-            q4_quantize_f32(
+            q4_quantize_split_f32(
                 flat,
                 tmp_weights[layer, kv_idx],
                 all_scales[layer, kv_idx],

@@ -5,7 +5,10 @@ import pytest
 
 from eakv._quantize import quantize
 from eakv._restore import dequantize
-from eakv._attention import attention_scores, attention_output
+from eakv._attention import (
+    attention_scores, attention_output,
+    attention_scores_multi, attention_output_multi,
+)
 
 
 def _make_kv_cache(n_layers=1, n_heads=4, seq_len=64, head_dim=128, seed=42):
@@ -96,6 +99,67 @@ class TestFusedVSum:
         ref = restored[0, 1, 0, 7]
         fused = attention_output(bundle, w, layer=0, head=0)
         np.testing.assert_allclose(fused, ref, atol=1e-4)
+
+
+class TestFusedKScoreMulti:
+    def test_matches_per_head(self):
+        """Multi-head kernel must match per-head kernel for all heads."""
+        kv = _make_kv_cache(n_heads=4)
+        bundle = quantize(kv)
+        q_vec = np.random.default_rng(99).standard_normal(128).astype(np.float32)
+        q_vecs = np.tile(q_vec, (4, 1))  # same query for all heads
+        multi_scores = attention_scores_multi(bundle, q_vecs, layer=0, n_heads=4)
+        for head in range(4):
+            single = attention_scores(bundle, q_vec, layer=0, head=head)
+            np.testing.assert_allclose(
+                multi_scores[head], single, atol=1e-5, err_msg=f"head {head}"
+            )
+
+    def test_different_queries(self):
+        """Each head gets its own query vector."""
+        kv = _make_kv_cache(n_heads=4)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        rng = np.random.default_rng(123)
+        q_vecs = rng.standard_normal((4, 128)).astype(np.float32)
+        multi_scores = attention_scores_multi(bundle, q_vecs, layer=0, n_heads=4)
+        for head in range(4):
+            ref = restored[0, 0, head] @ q_vecs[head] / np.sqrt(128.0)
+            np.testing.assert_allclose(
+                multi_scores[head], ref, atol=1e-4, err_msg=f"head {head}"
+            )
+
+
+class TestFusedVSumMulti:
+    def test_matches_per_head(self):
+        """Multi-head kernel must match per-head kernel for all heads."""
+        kv = _make_kv_cache(n_heads=4)
+        bundle = quantize(kv)
+        raw = np.random.default_rng(77).standard_normal(64).astype(np.float32)
+        w = _softmax(raw)
+        all_w = np.tile(w, (4, 1))
+        multi_out = attention_output_multi(bundle, all_w, layer=0, n_heads=4)
+        for head in range(4):
+            single = attention_output(bundle, w, layer=0, head=head)
+            np.testing.assert_allclose(
+                multi_out[head], single, atol=1e-5, err_msg=f"head {head}"
+            )
+
+    def test_different_weights(self):
+        """Each head gets its own weight vector."""
+        kv = _make_kv_cache(n_heads=4)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        rng = np.random.default_rng(55)
+        all_w = np.zeros((4, 64), dtype=np.float32)
+        for h in range(4):
+            all_w[h] = _softmax(rng.standard_normal(64).astype(np.float32))
+        multi_out = attention_output_multi(bundle, all_w, layer=0, n_heads=4)
+        for head in range(4):
+            ref = all_w[head] @ restored[0, 1, head]
+            np.testing.assert_allclose(
+                multi_out[head], ref, atol=1e-4, err_msg=f"head {head}"
+            )
 
 
 class TestAttentionValidation:

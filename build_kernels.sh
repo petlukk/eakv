@@ -33,7 +33,8 @@ esac
 
 echo "Building eakv kernels (ea=$EA)..."
 
-for kernel in quantize dequantize dequantize_u8 validate quantize_simd dequantize_simd; do
+# Kernels with auto-generated Python bindings
+for kernel in quantize_simd validate; do
     src="$KERNEL_DIR/${kernel}.ea"
     if [ ! -f "$src" ]; then
         echo "  WARNING: $src not found, skipping" >&2
@@ -64,8 +65,6 @@ for kernel in quantize dequantize dequantize_u8 validate quantize_simd dequantiz
     mv "$generated" "$BIND_DIR/_${kernel}_bind.py"
 
     # Fix library path: replace with_name("...") with parent / "lib" / "..."
-    # The generated code uses: _Path(__file__).with_name("...")
-    # We need: _Path(__file__).parent / "lib" / "lib<kernel>.so"
     sed -i "s|_Path(__file__).with_name(\"[^\"]*\")|_Path(__file__).parent / \"lib\" / \"${PREFIX}${kernel}${EXT}\"|" \
         "$BIND_DIR/_${kernel}_bind.py"
 

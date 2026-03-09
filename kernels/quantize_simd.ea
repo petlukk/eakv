@@ -1,10 +1,12 @@
-// Q4_1 quantization: 64 f32 values -> 32 packed bytes + scale + bias
+// Q4_1 quantization with SIMD-friendly split packing format
 //
-// weights_out is *mut i32 with 32 elements per group.
-// Each i32 holds one packed byte (value 0-255): hi_nibble * 16 + lo_nibble.
-// This avoids sign overflow that occurs when packing 4 bytes into one i32.
+// Split packing: for 64 values in a group:
+//   byte[k] = quant(value[k+32]) * 16 + quant(value[k])   for k = 0..31
+//   lo nibble stores first 32 values, hi nibble stores last 32 values
+//
+// This layout enables contiguous SIMD loads in the dequantize kernel.
 
-export func q4_quantize_f32(
+export func q4_quantize_split_f32(
     src: *restrict f32,
     weights_out: *mut i32,
     scales_out: *mut f32,
@@ -38,28 +40,26 @@ export func q4_quantize_f32(
         scales_out[g] = scale
         biases_out[g] = min_val
 
-        // Quantize pairs and pack into bytes (one i32 per byte, value 0-255)
+        // Pack with split layout: lo nibble = value[k], hi nibble = value[k+32]
         let w_base: i32 = g * 32
         let mut k: i32 = 0
-        while k < 64 {
-            let v0: f32 = (src[base + k] - min_val) * inv_scale
-            let v1: f32 = (src[base + k + 1] - min_val) * inv_scale
-            let mut q0: i32 = to_i32(v0 + half)
-            let mut q1: i32 = to_i32(v1 + half)
-            q0 = max(0, min(15, q0))
-            q1 = max(0, min(15, q1))
-            // Pack two nibbles into one byte: hi*16 + lo
-            weights_out[w_base + k / 2] = q1 * 16 + q0
-            k = k + 2
+        while k < 32 {
+            let v_lo: f32 = (src[base + k] - min_val) * inv_scale
+            let v_hi: f32 = (src[base + k + 32] - min_val) * inv_scale
+            let mut q_lo: i32 = to_i32(v_lo + half)
+            let mut q_hi: i32 = to_i32(v_hi + half)
+            q_lo = max(0, min(15, q_lo))
+            q_hi = max(0, min(15, q_hi))
+            weights_out[w_base + k] = q_hi * 16 + q_lo
+            k = k + 1
         }
 
         g = g + 1
     }
 }
 
-// Fused quantize + NaN/Inf validation
-// Returns 0 on success, (group_index + 1) on NaN detected
-export func q4_quantize_validated_f32(
+// Fused quantize + NaN validation with split packing
+export func q4_quantize_split_validated_f32(
     src: *restrict f32,
     weights_out: *mut i32,
     scales_out: *mut f32,
@@ -73,7 +73,6 @@ export func q4_quantize_validated_f32(
         let mut min_val: f32 = src[base]
         let mut max_val: f32 = src[base]
 
-        // NaN check: v != v is true for NaN
         if min_val != min_val { return g + 1 }
 
         let mut j: i32 = 1
@@ -96,18 +95,17 @@ export func q4_quantize_validated_f32(
         scales_out[g] = scale
         biases_out[g] = min_val
 
-        // Quantize pairs and pack into bytes (one i32 per byte, value 0-255)
         let w_base: i32 = g * 32
         let mut k: i32 = 0
-        while k < 64 {
-            let v0: f32 = (src[base + k] - min_val) * inv_scale
-            let v1: f32 = (src[base + k + 1] - min_val) * inv_scale
-            let mut q0: i32 = to_i32(v0 + half)
-            let mut q1: i32 = to_i32(v1 + half)
-            q0 = max(0, min(15, q0))
-            q1 = max(0, min(15, q1))
-            weights_out[w_base + k / 2] = q1 * 16 + q0
-            k = k + 2
+        while k < 32 {
+            let v_lo: f32 = (src[base + k] - min_val) * inv_scale
+            let v_hi: f32 = (src[base + k + 32] - min_val) * inv_scale
+            let mut q_lo: i32 = to_i32(v_lo + half)
+            let mut q_hi: i32 = to_i32(v_hi + half)
+            q_lo = max(0, min(15, q_lo))
+            q_hi = max(0, min(15, q_hi))
+            weights_out[w_base + k] = q_hi * 16 + q_lo
+            k = k + 1
         }
 
         g = g + 1

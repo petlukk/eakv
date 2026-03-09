@@ -13,7 +13,10 @@ import numpy as np
 sys.path.insert(0, "src")
 from eakv._quantize import quantize
 from eakv._restore import dequantize, restore
-from eakv._attention import attention_scores, attention_output
+from eakv._attention import (
+    attention_scores, attention_output,
+    attention_scores_multi, attention_output_multi,
+)
 from eakv._dispatch import q4_dequantize_dispatch
 
 
@@ -117,6 +120,36 @@ def main():
                         lambda: attention_output(bundle, w, layer=0, head=0))
 
         print(f"  Speedup vs restore+matmul: {t_base / t_fused:.2f}x")
+
+        # --- Multi-head comparison ---
+        print(f"\n  Multi-head ({nh} heads, K-score + V-sum combined):")
+
+        q_vecs = np.random.default_rng(99).standard_normal((nh, hd)).astype(np.float32)
+        all_w = np.stack([_softmax(np.random.default_rng(77 + h).standard_normal(sl).astype(np.float32))
+                          for h in range(nh)])
+
+        def per_head_loop():
+            scores = np.empty((nh, sl), dtype=np.float32)
+            outs = np.empty((nh, hd), dtype=np.float32)
+            for h in range(nh):
+                scores[h] = attention_scores(bundle, q_vecs[h], layer=0, head=h)
+                outs[h] = attention_output(bundle, all_w[h], layer=0, head=h)
+            return scores, outs
+
+        t_loop = bench(f"Per-head Python loop ({nh} heads)",
+                       per_head_loop)
+
+        def multi_call():
+            scores = attention_scores_multi(bundle, q_vecs, layer=0, n_heads=nh)
+            outs = attention_output_multi(bundle, all_w, layer=0, n_heads=nh)
+            return scores, outs
+
+        t_multi = bench(f"Multi-head kernel ({nh} heads)",
+                        multi_call)
+
+        saved = t_loop - t_multi
+        print(f"  Saved: {saved:.0f} us ({saved/t_loop*100:.1f}%), "
+              f"~{saved/nh:.0f} us/head ctypes overhead")
 
 
 if __name__ == "__main__":

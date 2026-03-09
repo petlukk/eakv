@@ -6,7 +6,10 @@ from ._restore import dequantize, restore
 from ._io import save, load, open_mmap
 from ._ops import q4_validate
 from ._dispatch import get_isa
-from ._attention import attention_scores, attention_output
+from ._attention import (
+    attention_scores, attention_output,
+    attention_scores_multi, attention_output_multi,
+)
 
 __version__ = "0.1.0"
 
@@ -21,6 +24,8 @@ __all__ = [
     "validate",
     "attention_scores",
     "attention_output",
+    "attention_scores_multi",
+    "attention_output_multi",
 ]
 
 

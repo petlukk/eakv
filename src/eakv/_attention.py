@@ -19,11 +19,21 @@ _k_lib.q4_fused_k_score_f32.argtypes = [
 ]
 _k_lib.q4_fused_k_score_f32.restype = None
 
+_k_lib.q4_fused_k_score_multi_f32.argtypes = [
+    _P_F32, _P_U8, _P_F32, _P_F32, _P_F32, _I32, _I32, _I32,
+]
+_k_lib.q4_fused_k_score_multi_f32.restype = None
+
 _v_lib = _ct.CDLL(str(_LIB_DIR / "libfused_v_sum.so"))
 _v_lib.q4_fused_v_sum_f32.argtypes = [
     _P_F32, _P_U8, _P_F32, _P_F32, _P_F32, _I32, _I32,
 ]
 _v_lib.q4_fused_v_sum_f32.restype = None
+
+_v_lib.q4_fused_v_sum_multi_f32.argtypes = [
+    _P_F32, _P_U8, _P_F32, _P_F32, _P_F32, _I32, _I32, _I32,
+]
+_v_lib.q4_fused_v_sum_multi_f32.restype = None
 
 
 def attention_scores(
@@ -98,3 +108,77 @@ def attention_output(
         _I32(group_offset),
     )
     return out_vec
+
+
+def attention_scores_multi(
+    bundle: Q4Bundle,
+    q_vecs: NDArray,
+    layer: int,
+    n_heads: int,
+) -> NDArray:
+    """Compute attention scores for all heads in one kernel call.
+
+    Args:
+        bundle: Q4Bundle with quantized KV cache
+        q_vecs: shape [n_heads, 128] f32 — query vectors for all heads
+        layer: transformer layer index
+        n_heads: number of heads to process
+
+    Returns:
+        scores: shape [n_heads, seq_len] f32 — raw scores (pre-softmax)
+    """
+    if bundle.head_dim != 128:
+        raise ValueError(f"Fused attention requires head_dim=128, got {bundle.head_dim}")
+
+    q_flat = np.ascontiguousarray(q_vecs.reshape(-1), dtype=np.float32)
+    scores = np.empty(n_heads * bundle.seq_len, dtype=np.float32)
+    groups_per_head = bundle.seq_len * 2
+
+    _k_lib.q4_fused_k_score_multi_f32(
+        q_flat.ctypes.data_as(_P_F32),
+        bundle.weights[layer, 0].ctypes.data_as(_P_U8),
+        bundle.scales[layer, 0].ctypes.data_as(_P_F32),
+        bundle.biases[layer, 0].ctypes.data_as(_P_F32),
+        scores.ctypes.data_as(_P_F32),
+        _I32(bundle.seq_len),
+        _I32(n_heads),
+        _I32(groups_per_head),
+    )
+    return scores.reshape(n_heads, bundle.seq_len)
+
+
+def attention_output_multi(
+    bundle: Q4Bundle,
+    all_weights: NDArray,
+    layer: int,
+    n_heads: int,
+) -> NDArray:
+    """Compute weighted V sum for all heads in one kernel call.
+
+    Args:
+        bundle: Q4Bundle with quantized KV cache
+        all_weights: shape [n_heads, seq_len] f32 — softmax weights for all heads
+        layer: transformer layer index
+        n_heads: number of heads to process
+
+    Returns:
+        out: shape [n_heads, 128] f32 — attention output vectors
+    """
+    if bundle.head_dim != 128:
+        raise ValueError(f"Fused attention requires head_dim=128, got {bundle.head_dim}")
+
+    w_flat = np.ascontiguousarray(all_weights.reshape(-1), dtype=np.float32)
+    out = np.empty(n_heads * 128, dtype=np.float32)
+    groups_per_head = bundle.seq_len * 2
+
+    _v_lib.q4_fused_v_sum_multi_f32(
+        w_flat.ctypes.data_as(_P_F32),
+        bundle.weights[layer, 1].ctypes.data_as(_P_U8),
+        bundle.scales[layer, 1].ctypes.data_as(_P_F32),
+        bundle.biases[layer, 1].ctypes.data_as(_P_F32),
+        out.ctypes.data_as(_P_F32),
+        _I32(bundle.seq_len),
+        _I32(n_heads),
+        _I32(groups_per_head),
+    )
+    return out.reshape(n_heads, 128)

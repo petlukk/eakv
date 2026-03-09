@@ -5,8 +5,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ._bundle import Q4Bundle
-from ._ops import q4_dequantize_f32, q4_dequantize_range_f32
-from ._ops import q4_dequantize_u8_f32, q4_dequantize_range_u8_f32
+from ._dispatch import q4_dequantize_dispatch, q4_dequantize_range_dispatch
 
 
 def dequantize(bundle: Q4Bundle) -> NDArray:
@@ -101,10 +100,8 @@ def restore(
 
 
 def _pick_dequantize(bundle: Q4Bundle):
-    """Select the right dequantize kernel based on weights dtype."""
-    if bundle.weights.dtype == np.uint8:
-        return q4_dequantize_u8_f32
-    return q4_dequantize_f32
+    """Select the dispatched SIMD dequantize kernel."""
+    return q4_dequantize_dispatch
 
 
 def _full_restore(bundle: Q4Bundle, out_dtype: str) -> NDArray:
