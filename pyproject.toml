@@ -13,6 +13,9 @@ dependencies = ["numpy>=1.21"]
 dev = ["pytest>=7.0"]
 compress = ["zstandard>=0.20"]
 
+[project.scripts]
+eakv = "eakv.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
