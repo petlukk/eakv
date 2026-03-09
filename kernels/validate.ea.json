@@ -1,0 +1,12 @@
+{
+  "library": "/root/dev/eakv/src/eakv/lib/libvalidate.so",
+  "exports": [
+    {
+      "name": "q4_validate",
+      "args": [{"name": "scales", "type": "*restrict f32", "direction": "in", "cap": null, "count": null}, {"name": "biases", "type": "*restrict f32", "direction": "in", "cap": null, "count": null}, {"name": "scales_bits", "type": "*restrict i32", "direction": "in", "cap": null, "count": null}, {"name": "biases_bits", "type": "*restrict i32", "direction": "in", "cap": null, "count": null}, {"name": "n_groups", "type": "i32", "direction": "in", "cap": null, "count": null}],
+      "return_type": "i32"
+    }
+  ],
+  "structs": [
+  ]
+}
