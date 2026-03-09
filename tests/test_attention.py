@@ -8,6 +8,7 @@ from eakv._restore import dequantize
 from eakv._attention import (
     attention_scores, attention_output,
     attention_scores_multi, attention_output_multi,
+    attention_fused, attention_fused_multi,
 )
 
 
@@ -159,6 +160,83 @@ class TestFusedVSumMulti:
             ref = all_w[head] @ restored[0, 1, head]
             np.testing.assert_allclose(
                 multi_out[head], ref, atol=1e-4, err_msg=f"head {head}"
+            )
+
+
+class TestFusedAttention:
+    def test_matches_separate_kernels(self):
+        """Fused attention must match scores→softmax→output pipeline."""
+        kv = _make_kv_cache()
+        bundle = quantize(kv)
+        q_vec = np.random.default_rng(99).standard_normal(128).astype(np.float32)
+        # Reference: separate kernels
+        scores = attention_scores(bundle, q_vec, layer=0, head=0)
+        weights = _softmax(scores)
+        ref_out = attention_output(bundle, weights, layer=0, head=0)
+        # Fused
+        fused_out = attention_fused(bundle, q_vec, layer=0, head=0)
+        np.testing.assert_allclose(fused_out, ref_out, atol=1e-4)
+
+    def test_all_heads(self):
+        kv = _make_kv_cache(n_heads=4)
+        bundle = quantize(kv)
+        q_vec = np.random.default_rng(99).standard_normal(128).astype(np.float32)
+        for head in range(4):
+            scores = attention_scores(bundle, q_vec, layer=0, head=head)
+            weights = _softmax(scores)
+            ref = attention_output(bundle, weights, layer=0, head=head)
+            fused = attention_fused(bundle, q_vec, layer=0, head=head)
+            np.testing.assert_allclose(fused, ref, atol=1e-4, err_msg=f"head {head}")
+
+    def test_matches_numpy_reference(self):
+        """Fused kernel must match full numpy softmax(QK^T/sqrt(d))·V."""
+        kv = _make_kv_cache()
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        q_vec = np.random.default_rng(99).standard_normal(128).astype(np.float32)
+        k_head = restored[0, 0, 0]
+        v_head = restored[0, 1, 0]
+        scores = k_head @ q_vec / np.sqrt(128.0)
+        ref_out = _softmax(scores) @ v_head
+        fused_out = attention_fused(bundle, q_vec, layer=0, head=0)
+        np.testing.assert_allclose(fused_out, ref_out, atol=1e-3)
+
+    def test_longer_sequence(self):
+        kv = _make_kv_cache(seq_len=512)
+        bundle = quantize(kv)
+        q_vec = np.random.default_rng(99).standard_normal(128).astype(np.float32)
+        scores = attention_scores(bundle, q_vec, layer=0, head=0)
+        weights = _softmax(scores)
+        ref = attention_output(bundle, weights, layer=0, head=0)
+        fused = attention_fused(bundle, q_vec, layer=0, head=0)
+        np.testing.assert_allclose(fused, ref, atol=1e-4)
+
+
+class TestFusedAttentionMulti:
+    def test_matches_per_head(self):
+        kv = _make_kv_cache(n_heads=4)
+        bundle = quantize(kv)
+        q_vecs = np.random.default_rng(123).standard_normal((4, 128)).astype(np.float32)
+        multi_out = attention_fused_multi(bundle, q_vecs, layer=0, n_heads=4)
+        for head in range(4):
+            single = attention_fused(bundle, q_vecs[head], layer=0, head=head)
+            np.testing.assert_allclose(
+                multi_out[head], single, atol=1e-5, err_msg=f"head {head}"
+            )
+
+    def test_matches_numpy_reference(self):
+        kv = _make_kv_cache(n_heads=4)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        q_vecs = np.random.default_rng(123).standard_normal((4, 128)).astype(np.float32)
+        multi_out = attention_fused_multi(bundle, q_vecs, layer=0, n_heads=4)
+        for head in range(4):
+            k_head = restored[0, 0, head]
+            v_head = restored[0, 1, head]
+            scores = k_head @ q_vecs[head] / np.sqrt(128.0)
+            ref = _softmax(scores) @ v_head
+            np.testing.assert_allclose(
+                multi_out[head], ref, atol=1e-3, err_msg=f"head {head}"
             )
 
 
