@@ -231,6 +231,10 @@ def attention_scores_gqa(
     if bundle.head_dim != 128:
         raise ValueError(f"Fused attention requires head_dim=128, got {bundle.head_dim}")
 
+    # MHA fast path: skip GQA overhead when no head sharing
+    if n_q_heads == n_kv_heads:
+        return attention_scores_multi(bundle, q_vecs, layer, n_q_heads)
+
     q_flat = np.ascontiguousarray(q_vecs.reshape(-1), dtype=np.float32)
     scores = np.empty(n_q_heads * bundle.seq_len, dtype=np.float32)
     groups_per_head = bundle.seq_len * 2
@@ -270,6 +274,10 @@ def attention_output_gqa(
     """
     if bundle.head_dim != 128:
         raise ValueError(f"Fused attention requires head_dim=128, got {bundle.head_dim}")
+
+    # MHA fast path: skip GQA overhead when no head sharing
+    if n_q_heads == n_kv_heads:
+        return attention_output_multi(bundle, all_weights, layer, n_q_heads)
 
     w_flat = np.ascontiguousarray(all_weights.reshape(-1), dtype=np.float32)
     out = np.empty(n_q_heads * 128, dtype=np.float32)
