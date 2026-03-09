@@ -76,7 +76,7 @@ output = eakv.attention_output(bundle, weights, layer=0, head=0)
 
 This is the core decode-time attention operation. The fused kernels dequantize each position into SIMD registers and immediately multiply, never writing intermediate f32 values to memory.
 
-## 5. Fused attention (all heads at once)
+## 5. Fused attention (all heads, MHA)
 
 For multiple heads, use the multi-head variants to avoid per-head Python overhead:
 
@@ -98,7 +98,42 @@ all_outputs = eakv.attention_output_multi(bundle, all_weights, layer=0, n_heads=
 
 At 2048 tokens with 8 heads, the multi-head kernel is ~2x faster than calling the single-head version in a Python loop.
 
-## 6. Memory-mapped access
+## 6. GQA attention (Grouped Query Attention)
+
+For models with fewer KV heads than query heads (LLaMA 2/3, Mistral, etc.):
+
+```python
+n_q_heads = 32   # query heads
+n_kv_heads = 8   # KV heads (4:1 ratio)
+
+queries = np.random.randn(n_q_heads, 128).astype(np.float32)
+
+# K-scores: dequantizes K once per token, reuses across grouped Q heads
+scores = eakv.attention_scores_gqa(bundle, queries, layer=0,
+                                    n_q_heads=n_q_heads, n_kv_heads=n_kv_heads)
+# -> shape (n_q_heads, seq_len), f32
+
+# Softmax each head
+weights = np.array([softmax(scores[h]) for h in range(n_q_heads)])
+
+# V-sum: 2-head paired accumulation for efficient register use
+output = eakv.attention_output_gqa(bundle, weights, layer=0,
+                                    n_q_heads=n_q_heads, n_kv_heads=n_kv_heads)
+# -> shape (n_q_heads, 128), f32
+```
+
+The GQA functions auto-dispatch: when `n_q_heads == n_kv_heads` (MHA), they route to the faster MHA kernels internally. You can use `attention_scores_gqa` / `attention_output_gqa` as the universal entry point.
+
+**Speedups vs naive (separate kernel per Q head):**
+
+| GQA ratio | K-score | V-sum |
+|---|---|---|
+| 4:1 (32Q/8KV) | 2.08x | 3.71x |
+| 4:1 (8Q/2KV) | 1.68x | 3.43x |
+| 2:1 (4Q/2KV) | 1.20x | 2.34x |
+| 1:1 (MHA) | auto-dispatch to MHA kernel | auto-dispatch to MHA kernel |
+
+## 7. Memory-mapped access
 
 For large caches that don't fit in RAM:
 
@@ -109,7 +144,7 @@ with eakv.open_mmap("kv_cache.eakv") as bundle:
     # Only the accessed pages are loaded from disk
 ```
 
-## 7. Validate a bundle
+## 8. Validate a bundle
 
 Check for NaN scales/biases or negative scales (corruption indicators):
 
@@ -121,7 +156,7 @@ eakv.validate(bundle)  # raises ValueError on corruption
 # eakv validate kv_cache.eakv
 ```
 
-## 8. Inspect a file
+## 9. Inspect a file
 
 ```bash
 $ eakv inspect kv_cache.eakv
@@ -137,7 +172,7 @@ Groups/layer:  32768
 Quant scheme:  Q4_1 (group size 64)
 ```
 
-## 9. ISA detection
+## 10. ISA detection
 
 eakv auto-detects your CPU and loads the fastest available kernel:
 
@@ -145,17 +180,17 @@ eakv auto-detects your CPU and loads the fastest available kernel:
 print(eakv.get_isa())  # 'avx512', 'avx2', or 'sse'
 ```
 
-AVX-512 is recommended. AVX2 and SSE work but are slower for dequantization. The fused attention kernels require AVX-512.
+AVX-512 is recommended. AVX2 and SSE work but are slower for dequantization. The fused attention and GQA kernels require AVX-512.
 
-## 10. Build kernels from source
+## 11. Build kernels from source
 
 If you need to rebuild the SIMD kernels (after modifying `.ea` source files):
 
 ```bash
-# Set EA to the Ea compiler path (or add to PATH)
+# Set EA to the Eä compiler path (or add to PATH)
 export EA=$HOME/dev/eacompute/target/release/ea
 
 ./build_kernels.sh
 ```
 
-This compiles 7 kernel files into 8 shared libraries (SSE and the SSE `.ea` source produce separate `.so` files) and generates 2 Python binding files.
+This compiles 9 kernel files into 10 shared libraries and generates 2 Python binding files.
