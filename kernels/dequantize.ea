@@ -1,0 +1,128 @@
+// Q4_1 dequantization: packed i32 weights + scale + bias -> f32 values
+//
+// Inverse of quantize.ea. Each group of 64 f32 values is stored as:
+//   - 8 i32 packed words (each = 4 bytes, each byte = 2 nibbles = 2 values)
+//   - 1 f32 scale
+//   - 1 f32 bias
+//
+// Packing format (little-endian):
+//   i32 = b3*16777216 + b2*65536 + b1*256 + b0
+//   each byte = hi_nibble * 16 + lo_nibble
+//   dequantized value = to_f32(nibble) * scale + bias
+
+// Full dequantize: all groups
+export func q4_dequantize_f32(
+    weights: *restrict i32,
+    scales: *restrict f32,
+    biases: *restrict f32,
+    out: *mut f32,
+    n_groups: i32
+) {
+    let mut g: i32 = 0
+    while g < n_groups {
+        let scale: f32 = scales[g]
+        let bias: f32 = biases[g]
+        let w_base: i32 = g * 8
+        let o_base: i32 = g * 64
+
+        let mut p: i32 = 0
+        while p < 8 {
+            let word: i32 = weights[w_base + p]
+            let out_off: i32 = o_base + p * 8
+
+            // Extract 4 bytes from the i32
+            let b0: i32 = word % 256
+            let b1: i32 = (word / 256) % 256
+            let b2: i32 = (word / 65536) % 256
+            let b3: i32 = word / 16777216
+
+            // Byte 0 -> values [0,1]
+            let lo0: i32 = b0 % 16
+            let hi0: i32 = b0 / 16
+            out[out_off] = to_f32(lo0) * scale + bias
+            out[out_off + 1] = to_f32(hi0) * scale + bias
+
+            // Byte 1 -> values [2,3]
+            let lo1: i32 = b1 % 16
+            let hi1: i32 = b1 / 16
+            out[out_off + 2] = to_f32(lo1) * scale + bias
+            out[out_off + 3] = to_f32(hi1) * scale + bias
+
+            // Byte 2 -> values [4,5]
+            let lo2: i32 = b2 % 16
+            let hi2: i32 = b2 / 16
+            out[out_off + 4] = to_f32(lo2) * scale + bias
+            out[out_off + 5] = to_f32(hi2) * scale + bias
+
+            // Byte 3 -> values [6,7]
+            let lo3: i32 = b3 % 16
+            let hi3: i32 = b3 / 16
+            out[out_off + 6] = to_f32(lo3) * scale + bias
+            out[out_off + 7] = to_f32(hi3) * scale + bias
+
+            p = p + 1
+        }
+
+        g = g + 1
+    }
+}
+
+// Partial dequantize: contiguous range of groups
+// Reads from weights[group_start*8..] and writes to out[0..group_count*64]
+export func q4_dequantize_range_f32(
+    weights: *restrict i32,
+    scales: *restrict f32,
+    biases: *restrict f32,
+    out: *mut f32,
+    group_start: i32,
+    group_count: i32
+) {
+    let mut i: i32 = 0
+    while i < group_count {
+        let g: i32 = group_start + i
+        let scale: f32 = scales[g]
+        let bias: f32 = biases[g]
+        let w_base: i32 = g * 8
+        let o_base: i32 = i * 64
+
+        let mut p: i32 = 0
+        while p < 8 {
+            let word: i32 = weights[w_base + p]
+            let out_off: i32 = o_base + p * 8
+
+            // Extract 4 bytes from the i32
+            let b0: i32 = word % 256
+            let b1: i32 = (word / 256) % 256
+            let b2: i32 = (word / 65536) % 256
+            let b3: i32 = word / 16777216
+
+            // Byte 0 -> values [0,1]
+            let lo0: i32 = b0 % 16
+            let hi0: i32 = b0 / 16
+            out[out_off] = to_f32(lo0) * scale + bias
+            out[out_off + 1] = to_f32(hi0) * scale + bias
+
+            // Byte 1 -> values [2,3]
+            let lo1: i32 = b1 % 16
+            let hi1: i32 = b1 / 16
+            out[out_off + 2] = to_f32(lo1) * scale + bias
+            out[out_off + 3] = to_f32(hi1) * scale + bias
+
+            // Byte 2 -> values [4,5]
+            let lo2: i32 = b2 % 16
+            let hi2: i32 = b2 / 16
+            out[out_off + 4] = to_f32(lo2) * scale + bias
+            out[out_off + 5] = to_f32(hi2) * scale + bias
+
+            // Byte 3 -> values [6,7]
+            let lo3: i32 = b3 % 16
+            let hi3: i32 = b3 / 16
+            out[out_off + 6] = to_f32(lo3) * scale + bias
+            out[out_off + 7] = to_f32(hi3) * scale + bias
+
+            p = p + 1
+        }
+
+        i = i + 1
+    }
+}
