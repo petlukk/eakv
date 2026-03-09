@@ -9,6 +9,7 @@ from ._dispatch import get_isa
 from ._attention import (
     attention_scores, attention_output,
     attention_scores_multi, attention_output_multi,
+    attention_scores_gqa, attention_output_gqa,
 )
 
 __version__ = "0.1.0"
@@ -26,6 +27,8 @@ __all__ = [
     "attention_output",
     "attention_scores_multi",
     "attention_output_multi",
+    "attention_scores_gqa",
+    "attention_output_gqa",
 ]
 
 

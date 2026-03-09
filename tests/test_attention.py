@@ -8,6 +8,7 @@ from eakv._restore import dequantize
 from eakv._attention import (
     attention_scores, attention_output,
     attention_scores_multi, attention_output_multi,
+    attention_scores_gqa, attention_output_gqa,
     attention_fused, attention_fused_multi,
 )
 
@@ -161,6 +162,85 @@ class TestFusedVSumMulti:
             np.testing.assert_allclose(
                 multi_out[head], ref, atol=1e-4, err_msg=f"head {head}"
             )
+
+
+class TestGQAKScore:
+    def test_mha_matches_multi(self):
+        """With n_q_heads == n_kv_heads (MHA), GQA must match standard multi."""
+        kv = _make_kv_cache(n_heads=4)
+        bundle = quantize(kv)
+        q_vecs = np.random.default_rng(123).standard_normal((4, 128)).astype(np.float32)
+        ref = attention_scores_multi(bundle, q_vecs, layer=0, n_heads=4)
+        gqa = attention_scores_gqa(bundle, q_vecs, layer=0, n_q_heads=4, n_kv_heads=4)
+        np.testing.assert_allclose(gqa, ref, atol=1e-5)
+
+    def test_gqa_4_to_2(self):
+        """4 Q heads, 2 KV heads: each KV head serves 2 Q heads."""
+        kv = _make_kv_cache(n_heads=2)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        q_vecs = np.random.default_rng(123).standard_normal((4, 128)).astype(np.float32)
+        scores = attention_scores_gqa(bundle, q_vecs, layer=0, n_q_heads=4, n_kv_heads=2)
+        for q_h in range(4):
+            kv_h = q_h // 2
+            ref = restored[0, 0, kv_h] @ q_vecs[q_h] / np.sqrt(128.0)
+            np.testing.assert_allclose(scores[q_h], ref, atol=1e-4,
+                                       err_msg=f"q_head {q_h} -> kv_head {kv_h}")
+
+    def test_gqa_8_to_2(self):
+        """8 Q heads, 2 KV heads: each KV head serves 4 Q heads."""
+        kv = _make_kv_cache(n_heads=2)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        q_vecs = np.random.default_rng(99).standard_normal((8, 128)).astype(np.float32)
+        scores = attention_scores_gqa(bundle, q_vecs, layer=0, n_q_heads=8, n_kv_heads=2)
+        for q_h in range(8):
+            kv_h = q_h // 4
+            ref = restored[0, 0, kv_h] @ q_vecs[q_h] / np.sqrt(128.0)
+            np.testing.assert_allclose(scores[q_h], ref, atol=1e-4,
+                                       err_msg=f"q_head {q_h} -> kv_head {kv_h}")
+
+
+class TestGQAVSum:
+    def test_mha_matches_multi(self):
+        """With n_q_heads == n_kv_heads, GQA V-sum must match standard multi."""
+        kv = _make_kv_cache(n_heads=4)
+        bundle = quantize(kv)
+        rng = np.random.default_rng(77)
+        all_w = np.array([_softmax(rng.standard_normal(64).astype(np.float32))
+                          for _ in range(4)])
+        ref = attention_output_multi(bundle, all_w, layer=0, n_heads=4)
+        gqa = attention_output_gqa(bundle, all_w, layer=0, n_q_heads=4, n_kv_heads=4)
+        np.testing.assert_allclose(gqa, ref, atol=1e-5)
+
+    def test_gqa_4_to_2(self):
+        """4 Q heads, 2 KV heads: V-sum with shared V data."""
+        kv = _make_kv_cache(n_heads=2)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        rng = np.random.default_rng(55)
+        all_w = np.array([_softmax(rng.standard_normal(64).astype(np.float32))
+                          for _ in range(4)])
+        out = attention_output_gqa(bundle, all_w, layer=0, n_q_heads=4, n_kv_heads=2)
+        for q_h in range(4):
+            kv_h = q_h // 2
+            ref = all_w[q_h] @ restored[0, 1, kv_h]
+            np.testing.assert_allclose(out[q_h], ref, atol=1e-4,
+                                       err_msg=f"q_head {q_h} -> kv_head {kv_h}")
+
+    def test_gqa_odd_ratio(self):
+        """3 Q heads, 1 KV head: odd ratio exercises remainder path."""
+        kv = _make_kv_cache(n_heads=1)
+        bundle = quantize(kv)
+        restored = dequantize(bundle)
+        rng = np.random.default_rng(33)
+        all_w = np.array([_softmax(rng.standard_normal(64).astype(np.float32))
+                          for _ in range(3)])
+        out = attention_output_gqa(bundle, all_w, layer=0, n_q_heads=3, n_kv_heads=1)
+        for q_h in range(3):
+            ref = all_w[q_h] @ restored[0, 1, 0]
+            np.testing.assert_allclose(out[q_h], ref, atol=1e-4,
+                                       err_msg=f"q_head {q_h}")
 
 
 class TestFusedAttention:

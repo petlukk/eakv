@@ -98,4 +98,7 @@ echo "    -> fused_v_sum (AVX-512, fused V weighted sum)"
 "$EA" "$KERNEL_DIR/fused_attention.ea" --lib --avx512 -o "$LIB_DIR/${PREFIX}fused_attention${EXT}"
 echo "    -> fused_attention (AVX-512, experimental fused softmax+attention)"
 
+"$EA" "$KERNEL_DIR/fused_k_score_gqa.ea" --lib --avx512 -o "$LIB_DIR/${PREFIX}fused_k_score_gqa${EXT}"
+echo "    -> fused_k_score_gqa (AVX-512, GQA loop-flipped K-score + V-sum)"
+
 echo "Done. Libraries in $LIB_DIR, bindings in $BIND_DIR"

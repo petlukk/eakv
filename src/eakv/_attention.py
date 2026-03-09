@@ -46,6 +46,17 @@ _a_lib.q4_fused_attention_multi_f32.argtypes = [
 ]
 _a_lib.q4_fused_attention_multi_f32.restype = None
 
+_gqa_lib = _ct.CDLL(str(_LIB_DIR / "libfused_k_score_gqa.so"))
+_gqa_lib.q4_k_score_gqa_f32.argtypes = [
+    _P_F32, _P_U8, _P_F32, _P_F32, _P_F32, _I32, _I32, _I32, _I32,
+]
+_gqa_lib.q4_k_score_gqa_f32.restype = None
+
+_gqa_lib.q4_v_sum_gqa_f32.argtypes = [
+    _P_F32, _P_U8, _P_F32, _P_F32, _P_F32, _I32, _I32, _I32, _I32,
+]
+_gqa_lib.q4_v_sum_gqa_f32.restype = None
+
 
 def attention_scores(
     bundle: Q4Bundle,
@@ -193,6 +204,89 @@ def attention_output_multi(
         _I32(groups_per_head),
     )
     return out.reshape(n_heads, 128)
+
+
+def attention_scores_gqa(
+    bundle: Q4Bundle,
+    q_vecs: NDArray,
+    layer: int,
+    n_q_heads: int,
+    n_kv_heads: int,
+) -> NDArray:
+    """Compute K-scores with GQA loop flip: K dequantized once, reused across Q heads.
+
+    Q heads [kv_h * q_per_kv .. (kv_h+1) * q_per_kv) share KV head kv_h.
+    For MHA (n_q_heads == n_kv_heads), equivalent to attention_scores_multi.
+
+    Args:
+        bundle: Q4Bundle with quantized KV cache (n_kv_heads heads)
+        q_vecs: shape [n_q_heads, 128] f32 — query vectors
+        layer: transformer layer index
+        n_q_heads: total query heads
+        n_kv_heads: KV heads (must divide n_q_heads evenly)
+
+    Returns:
+        scores: shape [n_q_heads, seq_len] f32
+    """
+    if bundle.head_dim != 128:
+        raise ValueError(f"Fused attention requires head_dim=128, got {bundle.head_dim}")
+
+    q_flat = np.ascontiguousarray(q_vecs.reshape(-1), dtype=np.float32)
+    scores = np.empty(n_q_heads * bundle.seq_len, dtype=np.float32)
+    groups_per_head = bundle.seq_len * 2
+
+    _gqa_lib.q4_k_score_gqa_f32(
+        q_flat.ctypes.data_as(_P_F32),
+        bundle.weights[layer, 0].ctypes.data_as(_P_U8),
+        bundle.scales[layer, 0].ctypes.data_as(_P_F32),
+        bundle.biases[layer, 0].ctypes.data_as(_P_F32),
+        scores.ctypes.data_as(_P_F32),
+        _I32(bundle.seq_len),
+        _I32(n_q_heads),
+        _I32(n_kv_heads),
+        _I32(groups_per_head),
+    )
+    return scores.reshape(n_q_heads, bundle.seq_len)
+
+
+def attention_output_gqa(
+    bundle: Q4Bundle,
+    all_weights: NDArray,
+    layer: int,
+    n_q_heads: int,
+    n_kv_heads: int,
+) -> NDArray:
+    """Compute V-sum with GQA: V dequantized once, paired Q heads accumulated together.
+
+    Args:
+        bundle: Q4Bundle with quantized KV cache (n_kv_heads heads)
+        all_weights: shape [n_q_heads, seq_len] f32 — softmax weights
+        layer: transformer layer index
+        n_q_heads: total query heads
+        n_kv_heads: KV heads (must divide n_q_heads evenly)
+
+    Returns:
+        out: shape [n_q_heads, 128] f32
+    """
+    if bundle.head_dim != 128:
+        raise ValueError(f"Fused attention requires head_dim=128, got {bundle.head_dim}")
+
+    w_flat = np.ascontiguousarray(all_weights.reshape(-1), dtype=np.float32)
+    out = np.empty(n_q_heads * 128, dtype=np.float32)
+    groups_per_head = bundle.seq_len * 2
+
+    _gqa_lib.q4_v_sum_gqa_f32(
+        w_flat.ctypes.data_as(_P_F32),
+        bundle.weights[layer, 1].ctypes.data_as(_P_U8),
+        bundle.scales[layer, 1].ctypes.data_as(_P_F32),
+        bundle.biases[layer, 1].ctypes.data_as(_P_F32),
+        out.ctypes.data_as(_P_F32),
+        _I32(bundle.seq_len),
+        _I32(n_q_heads),
+        _I32(n_kv_heads),
+        _I32(groups_per_head),
+    )
+    return out.reshape(n_q_heads, 128)
 
 
 def attention_fused(
