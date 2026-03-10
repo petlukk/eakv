@@ -18,7 +18,7 @@ KERNEL_OBJS = $(OBJ_DIR)/quantize_simd.o \
               $(OBJ_DIR)/fused_k_score_gqa.o
 
 # C source objects (explicit list — cli.c excluded, it has main())
-C_SRCS = $(SRC_DIR)/cache.c $(SRC_DIR)/attention.c $(SRC_DIR)/io.c
+C_SRCS = $(wildcard $(SRC_DIR)/*.c)
 C_OBJS = $(C_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
 LIB_STATIC = $(BUILD_DIR)/libeakv.a
