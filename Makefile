@@ -15,7 +15,10 @@ KERNEL_OBJS = $(OBJ_DIR)/quantize_simd.o \
               $(OBJ_DIR)/fused_k_score.o \
               $(OBJ_DIR)/fused_v_sum.o \
               $(OBJ_DIR)/fused_attention.o \
-              $(OBJ_DIR)/fused_k_score_gqa.o
+              $(OBJ_DIR)/fused_k_score_gqa.o \
+              $(OBJ_DIR)/fused_k_score_64.o \
+              $(OBJ_DIR)/fused_v_sum_64.o \
+              $(OBJ_DIR)/fused_k_score_gqa_64.o
 
 # C source objects (cli.c excluded — it has main())
 C_SRCS = $(filter-out $(SRC_DIR)/cli.c, $(wildcard $(SRC_DIR)/*.c))

@@ -6,15 +6,28 @@ void eakv_attention_scores(const eakv_cache_t *cache, const float *queries,
     const eakv_kv_data_t *k = &cache->kv[layer * 2 + 0];
     int32_t groups_per_head = cache->seq_len * (cache->head_dim / 64);
 
-    if (n_q_heads == n_kv_heads) {
-        q4_fused_k_score_multi_f32(
-            queries, k->weights, k->scales, k->biases,
-            scores_out, cache->seq_len, n_q_heads, groups_per_head);
+    if (cache->head_dim == 64) {
+        if (n_q_heads == n_kv_heads) {
+            q4_fused_k_score_multi_64_f32(
+                queries, k->weights, k->scales, k->biases,
+                scores_out, cache->seq_len, n_q_heads, groups_per_head);
+        } else {
+            q4_k_score_gqa_64_f32(
+                queries, k->weights, k->scales, k->biases,
+                scores_out, cache->seq_len, n_q_heads, n_kv_heads,
+                groups_per_head);
+        }
     } else {
-        q4_k_score_gqa_f32(
-            queries, k->weights, k->scales, k->biases,
-            scores_out, cache->seq_len, n_q_heads, n_kv_heads,
-            groups_per_head);
+        if (n_q_heads == n_kv_heads) {
+            q4_fused_k_score_multi_f32(
+                queries, k->weights, k->scales, k->biases,
+                scores_out, cache->seq_len, n_q_heads, groups_per_head);
+        } else {
+            q4_k_score_gqa_f32(
+                queries, k->weights, k->scales, k->biases,
+                scores_out, cache->seq_len, n_q_heads, n_kv_heads,
+                groups_per_head);
+        }
     }
 }
 
@@ -24,14 +37,27 @@ void eakv_attention_output(const eakv_cache_t *cache, const float *weights,
     const eakv_kv_data_t *v = &cache->kv[layer * 2 + 1];
     int32_t groups_per_head = cache->seq_len * (cache->head_dim / 64);
 
-    if (n_q_heads == n_kv_heads) {
-        q4_fused_v_sum_multi_f32(
-            weights, v->weights, v->scales, v->biases,
-            output_out, cache->seq_len, n_q_heads, groups_per_head);
+    if (cache->head_dim == 64) {
+        if (n_q_heads == n_kv_heads) {
+            q4_fused_v_sum_multi_64_f32(
+                weights, v->weights, v->scales, v->biases,
+                output_out, cache->seq_len, n_q_heads, groups_per_head);
+        } else {
+            q4_v_sum_gqa_64_f32(
+                weights, v->weights, v->scales, v->biases,
+                output_out, cache->seq_len, n_q_heads, n_kv_heads,
+                groups_per_head);
+        }
     } else {
-        q4_v_sum_gqa_f32(
-            weights, v->weights, v->scales, v->biases,
-            output_out, cache->seq_len, n_q_heads, n_kv_heads,
-            groups_per_head);
+        if (n_q_heads == n_kv_heads) {
+            q4_fused_v_sum_multi_f32(
+                weights, v->weights, v->scales, v->biases,
+                output_out, cache->seq_len, n_q_heads, groups_per_head);
+        } else {
+            q4_v_sum_gqa_f32(
+                weights, v->weights, v->scales, v->biases,
+                output_out, cache->seq_len, n_q_heads, n_kv_heads,
+                groups_per_head);
+        }
     }
 }

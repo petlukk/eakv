@@ -44,5 +44,8 @@ emit_obj "$KERNEL_DIR/fused_k_score.ea" fused_k_score --avx512
 emit_obj "$KERNEL_DIR/fused_v_sum.ea" fused_v_sum --avx512
 emit_obj "$KERNEL_DIR/fused_attention.ea" fused_attention --avx512
 emit_obj "$KERNEL_DIR/fused_k_score_gqa.ea" fused_k_score_gqa --avx512
+emit_obj "$KERNEL_DIR/fused_k_score_64.ea" fused_k_score_64 --avx512
+emit_obj "$KERNEL_DIR/fused_v_sum_64.ea" fused_v_sum_64 --avx512
+emit_obj "$KERNEL_DIR/fused_k_score_gqa_64.ea" fused_k_score_gqa_64 --avx512
 
 echo "Done. Objects in $OBJ_DIR"

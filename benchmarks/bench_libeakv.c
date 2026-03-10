@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 199309L
 #include "eakv.h"
+#include "internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +60,67 @@ static void bench_v_output(void *ctx) {
     memset(b->output, 0, (size_t)b->n_heads * b->head_dim * sizeof(float));
     eakv_attention_output(b->cache, b->weights, 0,
                           b->n_heads, b->n_heads, b->output);
+}
+
+/* F16 baseline: dequantize K to f32, then naive dot product */
+typedef struct {
+    eakv_cache_t *cache;
+    float *queries;
+    float *scores;
+    float *f32_buf;  /* dequantized K data */
+    int n_heads;
+    int seq_len;
+    int head_dim;
+} baseline_ctx_t;
+
+static void bench_baseline_k_scores(void *ctx) {
+    baseline_ctx_t *b = ctx;
+    eakv_kv_data_t *k = &b->cache->kv[0];  /* layer 0, K */
+    int n_groups = b->cache->groups_per_token * b->seq_len;
+
+    /* Step 1: dequantize Q4 -> f32 */
+    q4_dequantize_avx512_f32(k->weights, k->scales, k->biases,
+                              b->f32_buf, n_groups);
+
+    /* Step 2: scaled dot product scores[h][t] = dot(query[h], K[h][t]) / sqrt(d) */
+    int hd = b->head_dim;
+    float scale = 1.0f / sqrtf((float)hd);
+    for (int h = 0; h < b->n_heads; h++) {
+        const float *q = b->queries + h * hd;
+        for (int t = 0; t < b->seq_len; t++) {
+            const float *kv = b->f32_buf + (h * b->seq_len + t) * hd;
+            float sum = 0.0f;
+            for (int d = 0; d < hd; d++)
+                sum += q[d] * kv[d];
+            b->scores[h * b->seq_len + t] = sum * scale;
+        }
+    }
+}
+
+/* Pure f32 baseline: no quantization at all, just dot product on raw f32 */
+typedef struct {
+    float *f32_data;  /* raw f32 K data */
+    float *queries;
+    float *scores;
+    int n_heads;
+    int seq_len;
+    int head_dim;
+} f32_ctx_t;
+
+static void bench_f32_k_scores(void *ctx) {
+    f32_ctx_t *b = ctx;
+    int hd = b->head_dim;
+    float scale = 1.0f / sqrtf((float)hd);
+    for (int h = 0; h < b->n_heads; h++) {
+        const float *q = b->queries + h * hd;
+        for (int t = 0; t < b->seq_len; t++) {
+            const float *kv = b->f32_data + (h * b->seq_len + t) * hd;
+            float sum = 0.0f;
+            for (int d = 0; d < hd; d++)
+                sum += q[d] * kv[d];
+            b->scores[h * b->seq_len + t] = sum * scale;
+        }
+    }
 }
 
 typedef struct {
@@ -127,6 +189,28 @@ int main(void) {
                            bench_k_scores, &bctx, 5, 20);
         bench("attention_output (1 layer, all heads)",
               bench_v_output, &bctx, 5, 20);
+
+        /* Baseline: dequant + naive dot product */
+        size_t f32_k_size = (size_t)nh * sl * hd;
+        float *f32_buf = malloc(f32_k_size * sizeof(float));
+        baseline_ctx_t blctx = {cache, queries, scores, f32_buf,
+                                nh, sl, hd};
+        double t_bl = bench("baseline: dequant+dot (1L, all heads)",
+                            bench_baseline_k_scores, &blctx, 5, 20);
+
+        /* Pure f32 baseline */
+        f32_ctx_t fctx = {data, queries, scores, nh, sl, hd};
+        double t_f32 = bench("baseline: pure f32 dot (1L, all heads)",
+                             bench_f32_k_scores, &fctx, 5, 20);
+
+        free(f32_buf);
+
+        printf("\n  --- K-score comparison ---\n");
+        printf("  fused Q4 (eakv):       %8.0f us\n", t_k);
+        printf("  dequant + dot:         %8.0f us (%.1fx slower)\n",
+               t_bl, t_bl / t_k);
+        printf("  pure f32 dot:          %8.0f us (%.1fx slower)\n",
+               t_f32, t_f32 / t_k);
 
         double k_bytes = (double)nh * sl * 32 * 2;
         double k_gbps = k_bytes / (t_k * 1e-6) / 1e9;

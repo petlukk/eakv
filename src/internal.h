@@ -40,7 +40,20 @@ extern void q4_fused_k_score_multi_f32(
     float *all_scores, int32_t seq_len,
     int32_t n_heads, int32_t groups_per_head);
 
+extern void q4_fused_k_score_multi_64_f32(
+    const float *q_vecs, const uint8_t *k_packed,
+    const float *k_scales, const float *k_biases,
+    float *all_scores, int32_t seq_len,
+    int32_t n_heads, int32_t groups_per_head);
+
 extern void q4_k_score_gqa_f32(
+    const float *q_vecs, const uint8_t *k_packed,
+    const float *k_scales, const float *k_biases,
+    float *all_scores, int32_t seq_len,
+    int32_t n_q_heads, int32_t n_kv_heads,
+    int32_t groups_per_head);
+
+extern void q4_k_score_gqa_64_f32(
     const float *q_vecs, const uint8_t *k_packed,
     const float *k_scales, const float *k_biases,
     float *all_scores, int32_t seq_len,
@@ -53,7 +66,20 @@ extern void q4_fused_v_sum_multi_f32(
     float *all_out, int32_t seq_len,
     int32_t n_heads, int32_t groups_per_head);
 
+extern void q4_fused_v_sum_multi_64_f32(
+    const float *all_weights, const uint8_t *v_packed,
+    const float *v_scales, const float *v_biases,
+    float *all_out, int32_t seq_len,
+    int32_t n_heads, int32_t groups_per_head);
+
 extern void q4_v_sum_gqa_f32(
+    const float *all_weights, const uint8_t *v_packed,
+    const float *v_scales, const float *v_biases,
+    float *all_out, int32_t seq_len,
+    int32_t n_q_heads, int32_t n_kv_heads,
+    int32_t groups_per_head);
+
+extern void q4_v_sum_gqa_64_f32(
     const float *all_weights, const uint8_t *v_packed,
     const float *v_scales, const float *v_biases,
     float *all_out, int32_t seq_len,
