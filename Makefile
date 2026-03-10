@@ -17,8 +17,8 @@ KERNEL_OBJS = $(OBJ_DIR)/quantize_simd.o \
               $(OBJ_DIR)/fused_attention.o \
               $(OBJ_DIR)/fused_k_score_gqa.o
 
-# C source objects (explicit list — cli.c excluded, it has main())
-C_SRCS = $(wildcard $(SRC_DIR)/*.c)
+# C source objects (cli.c excluded — it has main())
+C_SRCS = $(filter-out $(SRC_DIR)/cli.c, $(wildcard $(SRC_DIR)/*.c))
 C_OBJS = $(C_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
 LIB_STATIC = $(BUILD_DIR)/libeakv.a
@@ -43,7 +43,7 @@ $(LIB_SHARED): $(C_OBJS) $(KERNEL_OBJS)
 cli: $(CLI_BIN)
 
 $(CLI_BIN): $(SRC_DIR)/cli.c $(LIB_STATIC) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -leakv $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB_STATIC) $(LDFLAGS) -o $@
 
 # Tests
 TEST_SRCS = $(wildcard tests/test_*.c)
@@ -53,7 +53,7 @@ test: $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== $$t ==="; $$t || exit 1; done
 
 $(BUILD_DIR)/test_%: tests/test_%.c $(LIB_STATIC) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -Itests $< -L$(BUILD_DIR) -leakv $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) -Itests $< $(LIB_STATIC) $(LDFLAGS) -o $@
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
