@@ -31,6 +31,20 @@ void          eakv_cache_free(eakv_cache_t *cache);
  * Layout: [layer][kv][head][pos][dim] */
 int eakv_cache_load_raw(eakv_cache_t *cache, const float *data, int seq_len);
 
+/* Incremental append — quantize and append n_tokens for one layer/kv pair.
+ * data: f32[n_kv_heads * n_tokens * head_dim], layout [head][token][dim]
+ * kv_idx: 0=K, 1=V
+ * Writes at current seq_len offset. Does NOT change seq_len.
+ * After appending all layers and both K/V, call eakv_cache_advance. */
+int eakv_cache_append(eakv_cache_t *cache, const float *data,
+                      int layer, int kv_idx, int n_tokens);
+
+/* Advance seq_len by n_tokens. Call after appending all layers/kv. */
+int eakv_cache_advance(eakv_cache_t *cache, int n_tokens);
+
+/* Reset seq_len to 0. No deallocation — cache can be reused. */
+void eakv_cache_clear(eakv_cache_t *cache);
+
 /* Attention — operates directly on Q4 data.
  *
  * MHA: n_q_heads == n_kv_heads

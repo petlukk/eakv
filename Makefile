@@ -20,8 +20,8 @@ KERNEL_OBJS = $(OBJ_DIR)/quantize_simd.o \
               $(OBJ_DIR)/fused_v_sum_64.o \
               $(OBJ_DIR)/fused_k_score_gqa_64.o
 
-# C source objects (cli.c excluded — it has main())
-C_SRCS = $(filter-out $(SRC_DIR)/cli.c, $(wildcard $(SRC_DIR)/*.c))
+# C source objects (cli.c excluded — it has main(), llama_bridge.c needs llama.cpp)
+C_SRCS = $(filter-out $(SRC_DIR)/cli.c $(SRC_DIR)/llama_bridge.c, $(wildcard $(SRC_DIR)/*.c))
 C_OBJS = $(C_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
 LIB_STATIC = $(BUILD_DIR)/libeakv.a

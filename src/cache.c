@@ -63,27 +63,104 @@ int eakv_cache_load_raw(eakv_cache_t *cache, const float *data, int seq_len) {
     if (seq_len > cache->max_seq_len)
         return EAKV_ERR_INVALID;
 
-    int elems_per_lkv = cache->n_kv_heads * seq_len * cache->head_dim;
-    int n_groups = elems_per_lkv / 64;
+    int hd = cache->head_dim;
+    int nh = cache->n_kv_heads;
+    int gpd = hd / 64;  /* groups per token per head */
+    int gph = cache->max_seq_len * gpd;  /* groups per head in buffer (fixed stride) */
+    int n_groups_per_head = seq_len * gpd;
+    int elems_per_lkv = nh * seq_len * hd;
 
-    int32_t *tmp = malloc(n_groups * 32 * sizeof(int32_t));
+    int32_t *tmp = malloc(n_groups_per_head * 32 * sizeof(int32_t));
     if (!tmp) return EAKV_ERR_ALLOC;
 
     for (int l = 0; l < cache->n_layers; l++) {
         for (int kv = 0; kv < 2; kv++) {
-            const float *src = data + (l * 2 + kv) * elems_per_lkv;
+            const float *lkv_src = data + (l * 2 + kv) * elems_per_lkv;
             eakv_kv_data_t *d = &cache->kv[l * 2 + kv];
 
-            q4_quantize_split_f32(src, tmp, d->scales, d->biases, n_groups);
+            for (int h = 0; h < nh; h++) {
+                const float *src = lkv_src + h * seq_len * hd;
+                int group_base = h * gph;
 
-            for (int i = 0; i < n_groups * 32; i++)
-                d->weights[i] = (uint8_t)tmp[i];
+                q4_quantize_split_f32(src, tmp,
+                                       d->scales + group_base,
+                                       d->biases + group_base,
+                                       n_groups_per_head);
+
+                uint8_t *dst = d->weights + group_base * 32;
+                for (int i = 0; i < n_groups_per_head * 32; i++)
+                    dst[i] = (uint8_t)tmp[i];
+            }
         }
     }
 
     cache->seq_len = seq_len;
     free(tmp);
     return EAKV_OK;
+}
+
+int eakv_cache_append(eakv_cache_t *cache, const float *data,
+                      int layer, int kv_idx, int n_tokens) {
+    if (!cache || !data || n_tokens <= 0)
+        return EAKV_ERR_INVALID;
+    if (layer < 0 || layer >= cache->n_layers)
+        return EAKV_ERR_INVALID;
+    if (kv_idx < 0 || kv_idx > 1)
+        return EAKV_ERR_INVALID;
+    if (cache->seq_len + n_tokens > cache->max_seq_len)
+        return EAKV_ERR_INVALID;
+
+    /*
+     * Group layout in the flat buffer (matching bulk load_raw):
+     *   [head0: pos0_g0..pos0_gN, pos1_g0..pos1_gN, ...]
+     *   [head1: pos0_g0..pos0_gN, pos1_g0..pos1_gN, ...]
+     *
+     * groups_per_dim = head_dim / 64 (groups per token per head)
+     * groups_per_head = max_seq_len * groups_per_dim
+     *
+     * Input data layout: [head][token][dim]
+     * We quantize per-head and write at the right offset.
+     */
+    int hd = cache->head_dim;
+    int nh = cache->n_kv_heads;
+    int gpd = hd / 64;  /* groups per token per head */
+    int gph = cache->max_seq_len * gpd;  /* groups per head in buffer */
+    int n_groups_per_head = n_tokens * gpd;
+
+    int32_t *tmp = malloc(n_groups_per_head * 32 * sizeof(int32_t));
+    if (!tmp) return EAKV_ERR_ALLOC;
+
+    eakv_kv_data_t *d = &cache->kv[layer * 2 + kv_idx];
+
+    for (int h = 0; h < nh; h++) {
+        const float *src = data + h * n_tokens * hd;
+        int group_base = h * gph + cache->seq_len * gpd;
+
+        q4_quantize_split_f32(src, tmp,
+                               d->scales + group_base,
+                               d->biases + group_base,
+                               n_groups_per_head);
+
+        uint8_t *dst = d->weights + group_base * 32;
+        for (int i = 0; i < n_groups_per_head * 32; i++)
+            dst[i] = (uint8_t)tmp[i];
+    }
+
+    free(tmp);
+    return EAKV_OK;
+}
+
+int eakv_cache_advance(eakv_cache_t *cache, int n_tokens) {
+    if (!cache || n_tokens <= 0)
+        return EAKV_ERR_INVALID;
+    if (cache->seq_len + n_tokens > cache->max_seq_len)
+        return EAKV_ERR_INVALID;
+    cache->seq_len += n_tokens;
+    return EAKV_OK;
+}
+
+void eakv_cache_clear(eakv_cache_t *cache) {
+    if (cache) cache->seq_len = 0;
 }
 
 int eakv_cache_seq_len(const eakv_cache_t *cache) {

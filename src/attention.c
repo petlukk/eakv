@@ -4,7 +4,7 @@ void eakv_attention_scores(const eakv_cache_t *cache, const float *queries,
                            int layer, int n_q_heads, int n_kv_heads,
                            float *scores_out) {
     const eakv_kv_data_t *k = &cache->kv[layer * 2 + 0];
-    int32_t groups_per_head = cache->seq_len * (cache->head_dim / 64);
+    int32_t groups_per_head = cache->max_seq_len * (cache->head_dim / 64);
 
     if (cache->head_dim == 64) {
         if (n_q_heads == n_kv_heads) {
@@ -35,7 +35,7 @@ void eakv_attention_output(const eakv_cache_t *cache, const float *weights,
                            int layer, int n_q_heads, int n_kv_heads,
                            float *output_out) {
     const eakv_kv_data_t *v = &cache->kv[layer * 2 + 1];
-    int32_t groups_per_head = cache->seq_len * (cache->head_dim / 64);
+    int32_t groups_per_head = cache->max_seq_len * (cache->head_dim / 64);
 
     if (cache->head_dim == 64) {
         if (n_q_heads == n_kv_heads) {
