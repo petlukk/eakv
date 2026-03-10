@@ -1,196 +1,205 @@
 # How To Use eakv
 
-## 1. Quantize a KV cache
+eakv has two interfaces: a C library (`libeakv`) and a Python package. Both share the same Eä SIMD kernels and `.eakv` file format.
 
-eakv expects a 5D numpy array shaped `(n_layers, 2, n_heads, seq_len, head_dim)` where axis 1 is `[K, V]`. This matches the layout used by most transformer implementations.
+## C Library
+
+### Build
+
+```bash
+./build_kernels.sh    # compile .ea kernels -> .o object files + .so shared libs
+make                  # build libeakv.a, libeakv.so, eakv CLI
+make test             # 12 tests
+make bench            # performance benchmarks
+```
+
+### 1. Create a cache
+
+```c
+#include "eakv.h"
+
+// Pre-allocates for max_seq_len tokens. No realloc during use.
+eakv_cache_t *cache = eakv_cache_create(
+    32,    // n_layers
+    8,     // n_kv_heads
+    128,   // head_dim
+    4096   // max_seq_len
+);
+```
+
+`n_kv_heads * head_dim` must be a multiple of 64 (the quantization group size). This is true for all standard models.
+
+### 2. Load data
+
+```c
+// f32 array shaped [n_layers][2][n_kv_heads][seq_len][head_dim]
+// Axis 1: 0=K, 1=V
+float *kv_data = /* your KV cache */;
+int rc = eakv_cache_load_raw(cache, kv_data, seq_len);
+// rc == EAKV_OK on success
+```
+
+### 3. Run attention
+
+```c
+int n_q_heads = 32, n_kv_heads = 8;  // GQA 4:1
+int seq_len = eakv_cache_seq_len(cache);
+
+float queries[32 * 128];   // your query vectors
+float scores[32 * 4096];   // output: pre-softmax scores
+float weights[32 * 4096];  // input: post-softmax weights
+float output[32 * 128];    // output: attention vectors
+
+// K-scores: Q @ K^T / sqrt(d), directly on Q4 bytes
+eakv_attention_scores(cache, queries, layer, n_q_heads, n_kv_heads, scores);
+
+// ... apply softmax to scores -> weights ...
+
+// V weighted sum: weights @ V, directly on Q4 bytes
+eakv_attention_output(cache, weights, layer, n_q_heads, n_kv_heads, output);
+```
+
+MHA and GQA use the same functions. When `n_q_heads == n_kv_heads`, the library dispatches to the faster MHA kernel automatically.
+
+### 4. Save and load
+
+```c
+// Save
+eakv_cache_save(cache, "session.eakv");
+
+// Load
+eakv_cache_t *loaded = NULL;
+eakv_cache_load("session.eakv", &loaded);
+
+// Clean up
+eakv_cache_free(cache);
+eakv_cache_free(loaded);
+```
+
+Files are byte-compatible between the C library and Python package.
+
+### 5. CLI
+
+```bash
+$ eakv inspect session.eakv
+session.eakv
+  layers:     32
+  kv_heads:   8
+  head_dim:   128
+  seq_len:    2048
+  file_size:  80.0 MB
+  orig_size:  512.0 MB
+  ratio:      6.4x
+
+$ eakv validate session.eakv
+session.eakv: ok (32 layers checked)
+```
+
+### Error handling
+
+All functions returning `int` use these codes:
+
+| Code | Meaning |
+|---|---|
+| `EAKV_OK` (0) | Success |
+| `EAKV_ERR_IO` (-1) | File open/read/write failed |
+| `EAKV_ERR_FORMAT` (-2) | Bad magic, version, or truncated file |
+| `EAKV_ERR_ALLOC` (-3) | malloc failed |
+| `EAKV_ERR_INVALID` (-4) | Bad parameters (null, out of range) |
+
+### Linking
+
+```bash
+# Static
+gcc myapp.c build/libeakv.a -lm -o myapp
+
+# Shared
+gcc myapp.c -Lbuild -leakv -lm -o myapp
+```
+
+---
+
+## Python Package
+
+### Install
+
+```bash
+pip install eakv
+```
+
+Pre-built wheels include all SIMD kernel libraries. No compiler needed.
+
+### 1. Quantize a KV cache
 
 ```python
 import numpy as np
 import eakv
 
-# From your model's KV cache (typically extracted from model internals)
+# From your model's KV cache
 # k_cache: (n_layers, n_heads, seq_len, head_dim)
 # v_cache: (n_layers, n_heads, seq_len, head_dim)
-kv = np.stack([k_cache, v_cache], axis=1)  # -> (n_layers, 2, n_heads, seq_len, head_dim)
+kv = np.stack([k_cache, v_cache], axis=1)
+# -> (n_layers, 2, n_heads, seq_len, head_dim)
 
 bundle = eakv.quantize(kv)
-print(f"Compressed to {bundle.compression_ratio:.0%} of original")
 ```
 
-The input must be float32 or float16. `head_dim * seq_len * n_heads` must be a multiple of 64 (the quantization group size). This is true for all standard models (head_dim is always 64 or 128).
+Input must be float32 or float16.
 
-## 2. Save and load
-
-```python
-# Save to disk
-eakv.save(bundle, "kv_cache.eakv")
-
-# Save with zstd compression (requires: pip install zstandard)
-eakv.save(bundle, "kv_cache.eakv", compression="zstd")
-
-# Load
-bundle = eakv.load("kv_cache.eakv")
-```
-
-The `.eakv` binary format stores metadata (layer count, head count, dimensions, original dtype) in a 512-byte header followed by 64-byte-aligned data arrays.
-
-## 3. Restore (decompress) the KV cache
+### 2. Save and load
 
 ```python
-# Full restore to FP32
-kv_restored = eakv.dequantize(bundle)  # -> (n_layers, 2, n_heads, seq_len, head_dim)
+eakv.save(bundle, "cache.eakv")
+bundle = eakv.load("cache.eakv")
 
-# Partial restore: specific layers, heads, or token ranges
-layer_0 = eakv.restore(bundle, layers=0)
-heads_01 = eakv.restore(bundle, heads=[0, 1])
-last_64 = eakv.restore(bundle, tokens=-64)
-combined = eakv.restore(bundle, layers=range(4), heads=0, tokens=-128)
-
-# Restore to FP16
-kv_f16 = eakv.restore(bundle, out_dtype="float16")
-```
-
-Partial restore still dequantizes full layers internally, then slices. It avoids allocating the full output array.
-
-## 4. Fused attention (single head)
-
-Compute attention directly on Q4 data. No decompression step, no intermediate arrays.
-
-```python
-query = np.random.randn(128).astype(np.float32)  # head_dim must be 128
-
-# K-scores: dot(query, K[t]) / sqrt(head_dim) for each position t
-scores = eakv.attention_scores(bundle, query, layer=0, head=0)
-# -> shape (seq_len,), f32
-
-# Softmax
-def softmax(x):
-    e = np.exp(x - x.max())
-    return e / e.sum()
-weights = softmax(scores)
-
-# V weighted sum: sum_t(weights[t] * V[t])
-output = eakv.attention_output(bundle, weights, layer=0, head=0)
-# -> shape (128,), f32
-```
-
-This is the core decode-time attention operation. The fused kernels dequantize each position into SIMD registers and immediately multiply, never writing intermediate f32 values to memory.
-
-## 5. Fused attention (all heads, MHA)
-
-For multiple heads, use the multi-head variants to avoid per-head Python overhead:
-
-```python
-n_heads = 8
-queries = np.random.randn(n_heads, 128).astype(np.float32)
-
-# All K-scores in one kernel call
-all_scores = eakv.attention_scores_multi(bundle, queries, layer=0, n_heads=n_heads)
-# -> shape (n_heads, seq_len), f32
-
-# Softmax each head
-all_weights = np.array([softmax(all_scores[h]) for h in range(n_heads)])
-
-# All V weighted sums in one kernel call
-all_outputs = eakv.attention_output_multi(bundle, all_weights, layer=0, n_heads=n_heads)
-# -> shape (n_heads, 128), f32
-```
-
-At 2048 tokens with 8 heads, the multi-head kernel is ~2x faster than calling the single-head version in a Python loop.
-
-## 6. GQA attention (Grouped Query Attention)
-
-For models with fewer KV heads than query heads (LLaMA 2/3, Mistral, etc.):
-
-```python
-n_q_heads = 32   # query heads
-n_kv_heads = 8   # KV heads (4:1 ratio)
-
-queries = np.random.randn(n_q_heads, 128).astype(np.float32)
-
-# K-scores: dequantizes K once per token, reuses across grouped Q heads
-scores = eakv.attention_scores_gqa(bundle, queries, layer=0,
-                                    n_q_heads=n_q_heads, n_kv_heads=n_kv_heads)
-# -> shape (n_q_heads, seq_len), f32
-
-# Softmax each head
-weights = np.array([softmax(scores[h]) for h in range(n_q_heads)])
-
-# V-sum: 2-head paired accumulation for efficient register use
-output = eakv.attention_output_gqa(bundle, weights, layer=0,
-                                    n_q_heads=n_q_heads, n_kv_heads=n_kv_heads)
-# -> shape (n_q_heads, 128), f32
-```
-
-The GQA functions auto-dispatch: when `n_q_heads == n_kv_heads` (MHA), they route to the faster MHA kernels internally. You can use `attention_scores_gqa` / `attention_output_gqa` as the universal entry point.
-
-**Speedups vs naive (separate kernel per Q head):**
-
-| GQA ratio | K-score | V-sum |
-|---|---|---|
-| 4:1 (32Q/8KV) | 2.08x | 3.71x |
-| 4:1 (8Q/2KV) | 1.68x | 3.43x |
-| 2:1 (4Q/2KV) | 1.20x | 2.34x |
-| 1:1 (MHA) | auto-dispatch to MHA kernel | auto-dispatch to MHA kernel |
-
-## 7. Memory-mapped access
-
-For large caches that don't fit in RAM:
-
-```python
-with eakv.open_mmap("kv_cache.eakv") as bundle:
-    # bundle.weights, .scales, .biases are mmap views (not loaded into RAM)
+# Memory-mapped access for large caches
+with eakv.open_mmap("cache.eakv") as bundle:
     scores = eakv.attention_scores(bundle, query, layer=0, head=0)
-    # Only the accessed pages are loaded from disk
 ```
 
-## 8. Validate a bundle
-
-Check for NaN scales/biases or negative scales (corruption indicators):
+### 3. Restore (decompress)
 
 ```python
-# Python API
+# Full restore to f32
+restored = eakv.dequantize(bundle)
+
+# Partial restore: layer, head, or token slicing
+partial = eakv.restore(bundle, layers=0, heads=[0, 1], tokens=-64)
+```
+
+### 4. Fused attention
+
+```python
+# Single head
+scores = eakv.attention_scores(bundle, query, layer=0, head=0)
+output = eakv.attention_output(bundle, weights, layer=0, head=0)
+
+# All heads (one kernel call)
+scores = eakv.attention_scores_multi(bundle, queries, layer=0, n_heads=8)
+output = eakv.attention_output_multi(bundle, all_weights, layer=0, n_heads=8)
+
+# GQA (auto-dispatches MHA when n_q == n_kv)
+scores = eakv.attention_scores_gqa(bundle, queries, layer=0,
+                                    n_q_heads=32, n_kv_heads=8)
+output = eakv.attention_output_gqa(bundle, weights, layer=0,
+                                    n_q_heads=32, n_kv_heads=8)
+```
+
+### 5. Validate and inspect
+
+```python
 eakv.validate(bundle)  # raises ValueError on corruption
-
-# CLI
-# eakv validate kv_cache.eakv
-```
-
-## 9. Inspect a file
-
-```bash
-$ eakv inspect kv_cache.eakv
-File:          kv_cache.eakv
-File size:     167.2 MB
-Original size: 536.9 MB (float32)
-Compression:   31.1%
-Layers:        32
-Heads:         8
-Seq length:    2048
-Head dim:      128
-Groups/layer:  32768
-Quant scheme:  Q4_1 (group size 64)
-```
-
-## 10. ISA detection
-
-eakv auto-detects your CPU and loads the fastest available kernel:
-
-```python
 print(eakv.get_isa())  # 'avx512', 'avx2', or 'sse'
 ```
 
-AVX-512 is recommended. AVX2 and SSE work but are slower for dequantization. The fused attention and GQA kernels require AVX-512.
-
-## 11. Build kernels from source
-
-If you need to rebuild the SIMD kernels (after modifying `.ea` source files):
-
 ```bash
-# Set EA to the Eä compiler path (or add to PATH)
-export EA=$HOME/dev/eacompute/target/release/ea
-
-./build_kernels.sh
+eakv inspect cache.eakv
+eakv validate cache.eakv
 ```
 
-This compiles 9 kernel files into 10 shared libraries and generates 2 Python binding files.
+### 6. Build kernels from source
+
+```bash
+export EA=$HOME/dev/eacompute/target/release/ea
+./build_kernels.sh
+```
