@@ -25,7 +25,9 @@ LIB_STATIC = $(BUILD_DIR)/libeakv.a
 LIB_SHARED = $(BUILD_DIR)/libeakv.so
 CLI_BIN    = $(BUILD_DIR)/eakv
 
-.PHONY: all lib cli test clean
+BENCH_BIN  = $(BUILD_DIR)/bench_libeakv
+
+.PHONY: all lib cli test bench clean
 
 all: lib cli
 
@@ -55,8 +57,15 @@ test: $(TEST_BINS)
 $(BUILD_DIR)/test_%: tests/test_%.c $(LIB_STATIC) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Itests $< $(LIB_STATIC) $(LDFLAGS) -o $@
 
+# Benchmarks
+bench: $(BENCH_BIN)
+	$(BENCH_BIN)
+
+$(BENCH_BIN): benchmarks/bench_libeakv.c $(LIB_STATIC) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(LIB_STATIC) $(LDFLAGS) -o $@
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 clean:
-	rm -f $(C_OBJS) $(LIB_STATIC) $(LIB_SHARED) $(CLI_BIN) $(TEST_BINS)
+	rm -f $(C_OBJS) $(LIB_STATIC) $(LIB_SHARED) $(CLI_BIN) $(TEST_BINS) $(BENCH_BIN)
