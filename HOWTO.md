@@ -1,19 +1,15 @@
 # How To Use eakv
 
-eakv has two interfaces: a C library (`libeakv`) and a Python package. Both share the same Eä SIMD kernels and `.eakv` file format.
-
-## C Library
-
-### Build
+## Build
 
 ```bash
-./build_kernels.sh    # compile .ea kernels -> .o object files + .so shared libs
+./build_kernels.sh    # compile .ea kernels -> .o object files
 make                  # build libeakv.a, libeakv.so, eakv CLI
 make test             # 12 tests
 make bench            # performance benchmarks
 ```
 
-### 1. Create a cache
+## 1. Create a cache
 
 ```c
 #include "eakv.h"
@@ -29,7 +25,7 @@ eakv_cache_t *cache = eakv_cache_create(
 
 `n_kv_heads * head_dim` must be a multiple of 64 (the quantization group size). This is true for all standard models.
 
-### 2. Load data
+## 2. Load data
 
 ```c
 // f32 array shaped [n_layers][2][n_kv_heads][seq_len][head_dim]
@@ -39,7 +35,7 @@ int rc = eakv_cache_load_raw(cache, kv_data, seq_len);
 // rc == EAKV_OK on success
 ```
 
-### 3. Run attention
+## 3. Run attention
 
 ```c
 int n_q_heads = 32, n_kv_heads = 8;  // GQA 4:1
@@ -61,7 +57,7 @@ eakv_attention_output(cache, weights, layer, n_q_heads, n_kv_heads, output);
 
 MHA and GQA use the same functions. When `n_q_heads == n_kv_heads`, the library dispatches to the faster MHA kernel automatically.
 
-### 4. Save and load
+## 4. Save and load
 
 ```c
 // Save
@@ -76,9 +72,7 @@ eakv_cache_free(cache);
 eakv_cache_free(loaded);
 ```
 
-Files are byte-compatible between the C library and Python package.
-
-### 5. CLI
+## 5. CLI
 
 ```bash
 $ eakv inspect session.eakv
@@ -95,7 +89,7 @@ $ eakv validate session.eakv
 session.eakv: ok (32 layers checked)
 ```
 
-### Error handling
+## Error handling
 
 All functions returning `int` use these codes:
 
@@ -107,7 +101,7 @@ All functions returning `int` use these codes:
 | `EAKV_ERR_ALLOC` (-3) | malloc failed |
 | `EAKV_ERR_INVALID` (-4) | Bad parameters (null, out of range) |
 
-### Linking
+## Linking
 
 ```bash
 # Static
@@ -117,87 +111,7 @@ gcc myapp.c build/libeakv.a -lm -o myapp
 gcc myapp.c -Lbuild -leakv -lm -o myapp
 ```
 
----
-
-## Python Package
-
-### Install
-
-```bash
-pip install eakv
-```
-
-Pre-built wheels include all SIMD kernel libraries. No compiler needed.
-
-### 1. Quantize a KV cache
-
-```python
-import numpy as np
-import eakv
-
-# From your model's KV cache
-# k_cache: (n_layers, n_heads, seq_len, head_dim)
-# v_cache: (n_layers, n_heads, seq_len, head_dim)
-kv = np.stack([k_cache, v_cache], axis=1)
-# -> (n_layers, 2, n_heads, seq_len, head_dim)
-
-bundle = eakv.quantize(kv)
-```
-
-Input must be float32 or float16.
-
-### 2. Save and load
-
-```python
-eakv.save(bundle, "cache.eakv")
-bundle = eakv.load("cache.eakv")
-
-# Memory-mapped access for large caches
-with eakv.open_mmap("cache.eakv") as bundle:
-    scores = eakv.attention_scores(bundle, query, layer=0, head=0)
-```
-
-### 3. Restore (decompress)
-
-```python
-# Full restore to f32
-restored = eakv.dequantize(bundle)
-
-# Partial restore: layer, head, or token slicing
-partial = eakv.restore(bundle, layers=0, heads=[0, 1], tokens=-64)
-```
-
-### 4. Fused attention
-
-```python
-# Single head
-scores = eakv.attention_scores(bundle, query, layer=0, head=0)
-output = eakv.attention_output(bundle, weights, layer=0, head=0)
-
-# All heads (one kernel call)
-scores = eakv.attention_scores_multi(bundle, queries, layer=0, n_heads=8)
-output = eakv.attention_output_multi(bundle, all_weights, layer=0, n_heads=8)
-
-# GQA (auto-dispatches MHA when n_q == n_kv)
-scores = eakv.attention_scores_gqa(bundle, queries, layer=0,
-                                    n_q_heads=32, n_kv_heads=8)
-output = eakv.attention_output_gqa(bundle, weights, layer=0,
-                                    n_q_heads=32, n_kv_heads=8)
-```
-
-### 5. Validate and inspect
-
-```python
-eakv.validate(bundle)  # raises ValueError on corruption
-print(eakv.get_isa())  # 'avx512', 'avx2', or 'sse'
-```
-
-```bash
-eakv inspect cache.eakv
-eakv validate cache.eakv
-```
-
-### 6. Build kernels from source
+## Build kernels from source
 
 ```bash
 export EA=$HOME/dev/eacompute/target/release/ea

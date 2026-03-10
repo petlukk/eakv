@@ -1,6 +1,6 @@
 # eakv
 
-Q4 KV cache quantization for LLM inference. C library + CLI tool + Python package.
+Q4 KV cache quantization for LLM inference. C library + CLI tool.
 
 Compresses KV caches to ~16% of FP32 size (6.4x) using Q4_1 quantization with custom AVX-512 SIMD kernels written in [Eä](https://github.com/petlukk/eacompute). Runs attention directly on compressed data — no decompression needed.
 
@@ -38,9 +38,7 @@ Q4_1 with group size 64. Each group of 64 values → 32 packed bytes + scale (f3
 | 7B (8 KV heads) | 8K | 64 MB/layer | 10 MB/layer | 6.4x |
 | 7B (32 layers) | 2K | 512 MB total | 80 MB total | 6.4x |
 
-## C library (libeakv)
-
-### Build
+## Build
 
 ```bash
 ./build_kernels.sh    # compile Eä SIMD kernels (.ea -> .o)
@@ -51,7 +49,7 @@ make bench            # run benchmarks
 
 Requires the [Eä compiler](https://github.com/petlukk/eacompute) for kernel compilation. Set `EA=/path/to/ea` if not in PATH.
 
-### C API
+## C API
 
 ```c
 #include "eakv.h"
@@ -77,42 +75,11 @@ eakv_cache_free(cache);
 
 See `include/eakv.h` for the full API.
 
-### CLI
+## CLI
 
 ```bash
 eakv inspect cache.eakv    # show metadata, sizes, compression ratio
 eakv validate cache.eakv   # check for NaN/corruption via SIMD kernel
-```
-
-## Python package
-
-### Install
-
-```bash
-pip install eakv
-```
-
-### Quick start
-
-```python
-import numpy as np
-import eakv
-
-# Quantize: (n_layers, 2, n_heads, seq_len, head_dim)
-kv_cache = np.random.randn(32, 2, 8, 2048, 128).astype(np.float32)
-bundle = eakv.quantize(kv_cache)
-
-# Save / load
-eakv.save(bundle, "cache.eakv")
-bundle = eakv.load("cache.eakv")
-
-# GQA attention (auto-dispatches MHA when n_q == n_kv)
-queries = np.random.randn(32, 128).astype(np.float32)
-scores = eakv.attention_scores_gqa(bundle, queries, layer=0,
-                                    n_q_heads=32, n_kv_heads=8)
-
-# Validate integrity
-eakv.validate(bundle)
 ```
 
 ## Project structure
@@ -128,14 +95,6 @@ src/                         C library source
   io.c                         .eakv binary format save/load
   cli.c                        CLI tool (inspect, validate)
 
-src/eakv/                    Python library
-  _bundle.py                   Q4Bundle dataclass
-  _quantize.py                 quantize() API
-  _restore.py                  dequantize() / restore() with partial select
-  _attention.py                Fused attention (MHA + GQA with auto-dispatch)
-  _dispatch.py                 Runtime ISA detection (AVX-512 > AVX2 > SSE)
-  _io.py                       Binary .eakv format + mmap
-
 kernels/                     Eä SIMD kernel source (.ea)
   quantize_simd.ea             Q4_1 quantization (split lo/hi nibble packing)
   dequantize_{simd,avx2,avx512}.ea   Multi-ISA dequantization
@@ -145,12 +104,12 @@ kernels/                     Eä SIMD kernel source (.ea)
   fused_attention.ea           Fused softmax+attention (2-pass)
   validate.ea                  NaN/negative scale detection
 
-tests/                       C tests (12) + Python tests (60)
-benchmarks/                  C + Python benchmarks
+tests/                       12 C tests
+benchmarks/                  C benchmarks
 ```
 
 ## Requirements
 
-- x86-64 CPU (AVX-512 recommended, SSE minimum for Python package)
-- C library: GCC, Make, Eä compiler (for kernel compilation)
-- Python package: Python >= 3.9, NumPy >= 1.21
+- x86-64 CPU with AVX-512
+- GCC, Make
+- [Eä compiler](https://github.com/petlukk/eacompute) (for kernel compilation)

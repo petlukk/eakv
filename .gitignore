@@ -1,12 +1,7 @@
-__pycache__/
-*.pyc
-*.egg-info/
-dist/
 build/
 *.so
 *.dll
 *.o
 *.ll
 *.ea.json
-.pytest_cache/
 .worktrees/
