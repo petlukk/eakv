@@ -163,6 +163,18 @@ void eakv_cache_clear(eakv_cache_t *cache) {
     if (cache) cache->seq_len = 0;
 }
 
+int eakv_checkpoint(eakv_cache_t *cache) {
+    if (!cache) return 0;
+    return cache->seq_len;
+}
+
+int eakv_restore(eakv_cache_t *cache, int seq_len) {
+    if (!cache) return EAKV_ERR_INVALID;
+    if (seq_len < 0 || seq_len > cache->seq_len) return EAKV_ERR_INVALID;
+    cache->seq_len = seq_len;
+    return EAKV_OK;
+}
+
 int eakv_cache_seq_len(const eakv_cache_t *cache) {
     return cache ? cache->seq_len : 0;
 }

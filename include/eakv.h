@@ -45,6 +45,13 @@ int eakv_cache_advance(eakv_cache_t *cache, int n_tokens);
 /* Reset seq_len to 0. No deallocation — cache can be reused. */
 void eakv_cache_clear(eakv_cache_t *cache);
 
+/* Checkpoint: returns current seq_len. O(1). */
+int eakv_checkpoint(eakv_cache_t *cache);
+
+/* Restore to a previous seq_len. O(1).
+ * Returns EAKV_OK on success, EAKV_ERR_INVALID if seq_len is out of range. */
+int eakv_restore(eakv_cache_t *cache, int seq_len);
+
 /* Attention — operates directly on Q4 data.
  *
  * MHA: n_q_heads == n_kv_heads
